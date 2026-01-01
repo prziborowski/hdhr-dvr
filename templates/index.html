@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>HDHomeRun DVR</title>
+
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .calendar { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; margin: 20px 0; }
+        .day { padding: 10px; border: 1px solid #ddd; text-align: center; }
+        .selected { background-color: #4CAF50; color: white; }
+        .channel-select { margin: 20px 0; }
+        .time-select { margin: 20px 0; }
+        .recordings { margin-top: 40px; }
+        .recording { padding: 10px; border: 1fr solid #ddd; margin: 10px 0; }
+        button { padding: 8px 16px; background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+        button:hover { background-color: #45a049; }
+    </style>
+</head>
+<body>
+    <h1>HDHomeRun DVR</h1>
+    <div class="calendar-controls">
+        <button onclick="previousMonth()">Previous</button>
+        <button onclick="nextMonth()">Next</button>
+        <span id="month-year">Month Year</span>
+    </div>
+
+    <div class="calendar">
+        <div class="day header">Sun</div>
+        <div class="day header">Mon</div>
+        <div class="day header">Tue</div>
+        <div class="day header">Wed</div>
+        <div class="day header">Thu</div>
+        <div class="day header">Fri</div>
+        <div class="day header">Sat</div>
+    </div>
+
+    <div class="channel-select">
+        <label for="channel">Select Channel:</label>
+        <select id="channel">
+            <option value="">-- Select Channel --</option>
+        </select>
+    </div>
+
+    <div class="time-select">
+        <label for="startTime">Start Time:</label>
+        <input type="time" id="startTime">
+        <label for="duration">Duration (minutes):</label>
+        <input type="number" id="duration" min="1" max="1440" value="60">
+        <button onclick="scheduleRecording()">Schedule Recording</button>
+    </div>
+
+    <div class="recordings">
+        <h2>Scheduled Recordings</h2>
+        <div id="recordingsList"></div>
+    </div>
+
+<script>
+    let selectedDate = null;
+    let channels = [];
+    let startingDay = 0;
+    let currentMonth = new Date().getMonth();
+    let currentYear = new Date().getFullYear();
+
+// Update the channel loading
+fetch('/api/channels')
+    .then(response => response.json())
+    .then(data => {
+        const channelSelect = document.getElementById('channel');
+        data.forEach(channel => {
+            const option = document.createElement('option');
+            option.value = channel.guideNumber;  // Use guideNumber as value
+            option.textContent = `${channel.guideNumber} - ${channel.guideName}`;
+            channelSelect.appendChild(option);
+        });
+    });
+
+    // Generate calendar
+    function generateCalendar() {
+        const calendar = document.querySelector('.calendar');
+        const monthYear = document.getElementById('month-year');
+
+        // Clear existing days (except headers)
+        const days = calendar.querySelectorAll('.day:not(.header)');
+        days.forEach(day => day.remove());
+
+        // Get first day of month
+        const firstDay = new Date(currentYear, currentMonth, 1);
+        startingDay = firstDay.getDay();
+
+        // Get days in month
+        const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+
+        // Update month/year display
+        const monthNames = ["January", "February", "March", "April", "May", "June",
+                            "July", "August", "September", "October", "November", "December"];
+        monthYear.textContent = `${monthNames[currentMonth]} ${currentYear}`;
+
+        // Add empty cells for days before the first day
+        for (let i = 0; i < startingDay; i++) {
+            const dayDiv = document.createElement('div');
+            dayDiv.className = 'day empty';
+            calendar.appendChild(dayDiv);
+        }
+
+        // Add days
+        for (let i = 1; i <= daysInMonth; i++) {
+            const dayDiv = document.createElement('div');
+            dayDiv.className = 'day';
+            dayDiv.textContent = i;
+            dayDiv.onclick = () => selectDate(currentYear, currentMonth + 1, i);
+            calendar.appendChild(dayDiv);
+        }
+    }
+
+    // Select date
+    function selectDate(year, month, day) {
+        // Remove previous selection
+        const previouslySelected = document.querySelector('.day.selected');
+        if (previouslySelected) {
+            previouslySelected.classList.remove('selected');
+        }
+
+        // Find the clicked day element
+        const days = document.querySelectorAll('.day:not(.header):not(.empty)');
+        let clickedDay = null;
+
+        // Find the day that matches our year/month/day
+        for (let d of days) {
+            const dNum = parseInt(d.textContent);
+            if (dNum === day) {
+                clickedDay = d;
+                break;
+            }
+        }
+
+        if (clickedDay) {
+            clickedDay.classList.add('selected');
+            selectedDate = `${year}-${month.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
+        }
+    }
+
+    // Month navigation
+    function previousMonth() {
+        if (currentMonth === 0) {
+            currentMonth = 11;
+            currentYear--;
+        } else {
+            currentMonth--;
+        }
+        generateCalendar();
+    }
+
+    function nextMonth() {
+        if (currentMonth === 11) {
+            currentMonth = 0;
+            currentYear++;
+        } else {
+            currentMonth++;
+        }
+        generateCalendar();
+    }
+
+    // Update the recording scheduling
+    function scheduleRecording() {
+        if (!selectedDate) {
+            alert('Please select a date');
+            return;
+        }
+    
+        const channelId = document.getElementById('channel').value;
+        const startTime = document.getElementById('startTime').value;
+        const duration = document.getElementById('duration').value;
+    
+        if (!channelId || !startTime || !duration) {
+            alert('Please fill in all fields');
+            return;
+        }
+    
+        fetch('/api/recordings', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                channelId: channelId,
+                date: selectedDate,
+                startTime: startTime,
+                duration: parseInt(duration)
+            })
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(err => { throw err; });
+            }
+            return response.json();
+        })
+        .then(data => {
+            alert('Recording scheduled!');
+            loadRecordings();
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            if (error.error) {
+                alert(error.error);
+            } else {
+                alert('Error scheduling recording');
+            }
+        });
+    }
+   
+   function loadRecordings() {
+        fetch('/api/recordings')
+            .then(response => response.json())
+            .then(data => {
+                const recordingsList = document.getElementById('recordingsList');
+                recordingsList.innerHTML = '';
+                data.forEach(recording => {
+                    const channelName = recording.guide_number ?
+                        `${recording.guide_number} - ${recording.guide_name}` :
+                        recording.channel_id;
+    
+                    const div = document.createElement('div');
+                    div.className = 'recording';
+                    div.innerHTML = `
+                        <strong>${recording.date} ${recording.start_time}</strong>
+                        <br>
+                        Duration: ${recording.duration} minutes
+                        <br>
+                        Channel: ${channelName}
+                        <br>
+                        Status: ${recording.status}
+                        ${recording.status === 'completed' ?
+                            `<div>Download link: <a href="/api/recordings/${recording.id}/file" target="_blank">/api/recordings/${recording.id}/file</a></div>` :
+                            ''}
+                        <button onclick="deleteRecording(${recording.id})">Delete</button>
+                    `;
+                    recordingsList.appendChild(div);
+                });
+            });
+    }
+ 
+    // Add this new function to handle downloading recordings
+    function downloadRecording(id) {
+        window.location.href = `/api/recordings/${id}/file`;
+    }
+ 
+    // Delete recording
+    function deleteRecording(id) {
+        fetch(`/api/recordings/${id}`, {
+            method: 'DELETE'
+        })
+        .then(() => {
+            loadRecordings();
+        });
+    }
+
+    // Initialize
+    generateCalendar();
+    loadRecordings();
+</script>
+
+</body>
+</html>
