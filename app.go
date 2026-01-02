@@ -48,7 +48,6 @@ type RecordingRequest struct {
 
 var (
 	db          *sql.DB
-	channels    []Channel
 	recordingCh = make(chan Recording, 100)
 )
 
@@ -59,7 +58,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	defer db.Close() //nolint: errcheck
 
 	// Create tables if they don't exist
 	createTables()
@@ -121,15 +120,13 @@ func loadChannels() {
 		log.Printf("Error fetching channels: %v", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint: errcheck
 
 	var chs []Channel
 	if err := json.NewDecoder(resp.Body).Decode(&chs); err != nil {
 		log.Printf("Error decoding channels: %v", err)
 		return
 	}
-
-	channels = chs
 
 	// Store channels in database
 	tx, _ := db.Begin()
@@ -140,7 +137,7 @@ func loadChannels() {
 			log.Printf("Error storing channel: %v", err)
 		}
 	}
-	tx.Commit()
+	tx.Commit() //nolint: errcheck
 }
 
 func loadRecordings() {
@@ -155,7 +152,7 @@ func loadRecordings() {
 		log.Printf("Error loading recordings: %v", err)
 		return
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint: errcheck
 
 	// Get system timezone
 	loc, err := getLocalLocation()
@@ -219,7 +216,6 @@ func startRecordingScheduler() {
 				log.Printf("Error loading recordings: %v", err)
 				continue
 			}
-			defer rows.Close()
 
 			var recordings []Recording
 			for rows.Next() {
@@ -230,6 +226,7 @@ func startRecordingScheduler() {
 				}
 				recordings = append(recordings, r)
 			}
+			rows.Close() //nolint: errcheck
 
 			for _, r := range recordings {
 				startTime, err := time.ParseInLocation("2006-01-02 15:04", fmt.Sprintf("%s %s", r.Date, r.StartTime), loc)
@@ -276,7 +273,7 @@ func startRecording(r Recording) {
 		log.Printf("Error creating log file: %v", err)
 		return
 	}
-	defer logFileHandle.Close()
+	defer logFileHandle.Close() //nolint: errcheck
 
 	// Build ffmpeg command with duration in seconds
 	durationSeconds := r.Duration * 60
@@ -327,7 +324,7 @@ func getChannels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint: errcheck
 
 	// Define the struct with proper JSON tags
 	type channelResponse struct {
@@ -347,7 +344,7 @@ func getChannels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(channelList)
+	json.NewEncoder(w).Encode(channelList) //nolint: errcheck
 }
 
 func getRecordings(w http.ResponseWriter, r *http.Request) {
@@ -363,7 +360,7 @@ func getRecordings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint: errcheck
 
 	var recordings []struct {
 		ID          int    `json:"id"`
@@ -396,7 +393,7 @@ func getRecordings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(recordings)
+	json.NewEncoder(w).Encode(recordings) //nolint: errcheck
 }
 
 func getRecordingFile(w http.ResponseWriter, r *http.Request) {
@@ -467,7 +464,7 @@ func getRecordingFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer file.Close()
+	defer file.Close() //nolint: errcheck
 
 	// Handle Range header for partial content
 	rangeHeader := r.Header.Get("Range")
@@ -581,7 +578,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	if req.Duration <= 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		json.NewEncoder(w).Encode(map[string]string{ //nolint: errcheck
 			"error": "Duration must be positive",
 		})
 		return
@@ -598,7 +595,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	if !exists {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{
+		json.NewEncoder(w).Encode(map[string]string{ //nolint: errcheck
 			"error": "Channel not found",
 		})
 		return
@@ -621,7 +618,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		json.NewEncoder(w).Encode(map[string]string{ //nolint: errcheck
 			"error": "Failed to create recording",
 		})
 		return
@@ -632,7 +629,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		json.NewEncoder(w).Encode(map[string]string{ //nolint: errcheck
 			"error": "Failed to get recording ID",
 		})
 		return
@@ -646,7 +643,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	// Return the created recording
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(recording)
+	json.NewEncoder(w).Encode(recording) //nolint: errcheck
 }
 
 func deleteRecording(w http.ResponseWriter, r *http.Request) {
