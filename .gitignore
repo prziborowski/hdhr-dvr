@@ -1,4 +1,8 @@
 app
+!app/*
 app.sh
 *.sw?
 recordings.db
+xmltv
+xmltv.sh
+guide*json

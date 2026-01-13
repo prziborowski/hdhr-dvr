@@ -10,51 +10,59 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/prziborowski/hdhr-dvr/pkg/types"
 )
 
-type Channel struct {
-	GuideNumber    string `json:"GuideNumber"`
-	GuideName      string `json:"GuideName"`
-	VideoCodec     string `json:"VideoCodec"`
-	AudioCodec     string `json:"AudioCodec"`
-	HD             int    `json:"HD"`
-	SignalStrength int    `json:"SignalStrength"`
-	SignalQuality  int    `json:"SignalQuality"`
-	URL            string `json:"URL"`
-}
-
-type Recording struct {
-	ID        int
-	ChannelID string
-	Date      string // YYYY-MM-DD
-	StartTime string // HH:MM
-	Duration  int    // Duration in minutes
-	Status    string
-	CreatedAt time.Time
-}
-
 type RecordingRequest struct {
-	ChannelID string `json:"channelId"`
-	Date      string `json:"date"`      // YYYY-MM-DD
-	StartTime string `json:"startTime"` // HH:MM
-	Duration  int    `json:"duration"`  // Duration in minutes
+	ChannelID string  `json:"channelId"`
+	Date      string  `json:"date"`      // YYYY-MM-DD
+	StartTime string  `json:"startTime"` // HH:MM
+	Duration  int     `json:"duration"`  // Duration in minutes
+	Title     *string `json:"title,omitempty"`
 }
 
 var (
-	db          *sql.DB
-	recordingCh = make(chan Recording, 100)
+	db             *sql.DB
+	recordingCh    = make(chan types.Recording, 100)
+	guideData      map[string]interface{}
+	guideDataMutex sync.RWMutex
+	watcher        *fsnotify.Watcher
 )
+
+func initDB() (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", "./recordings.db")
+	if err != nil {
+		return nil, err
+	}
+
+	// Set connection pool parameters
+	db.SetMaxOpenConns(10)   // Maximum number of open connections
+	db.SetMaxIdleConns(5)    // Maximum number of idle connections
+	db.SetConnMaxLifetime(0) // No connection lifetime limit
+
+	// Test the connection
+	err = db.Ping()
+	if err != nil {
+		return nil, err
+	}
+
+	return db, nil
+}
 
 func main() {
 	// Initialize database
 	var err error
-	db, err = sql.Open("sqlite3", "./recordings.db")
+	db, err = initDB()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -65,6 +73,10 @@ func main() {
 
 	// Load channels from HDHomeRun
 	loadChannels()
+
+	// Load guide data
+	loadGuide()
+	go setupFileWatcher("guide.json")
 
 	// Load existing recordings
 	loadRecordings()
@@ -82,6 +94,7 @@ func main() {
 	r.HandleFunc("/api/recordings", createRecording).Methods("POST")
 	r.HandleFunc("/api/recordings/{id}", deleteRecording).Methods("DELETE")
 	r.HandleFunc("/api/recordings/{id}/file", getRecordingFile).Methods("GET", "HEAD")
+	r.HandleFunc("/api/guide", getGuide).Methods("GET")
 
 	// Start server
 	log.Println("Server starting on :8080...")
@@ -101,7 +114,8 @@ func createTables() {
             channel_id TEXT,
             date TEXT,
             start_time TEXT,
-            duration INTEGER,  -- Changed from end_time to duration
+            title TEXT,
+            duration INTEGER,
             status TEXT DEFAULT 'pending',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(channel_id) REFERENCES channels(guide_number)
@@ -122,7 +136,7 @@ func loadChannels() {
 	}
 	defer resp.Body.Close() //nolint: errcheck
 
-	var chs []Channel
+	var chs []types.Channel
 	if err := json.NewDecoder(resp.Body).Decode(&chs); err != nil {
 		log.Printf("Error decoding channels: %v", err)
 		return
@@ -142,31 +156,49 @@ func loadChannels() {
 
 func loadRecordings() {
 	log.Println("Load recordings")
-	// Get all pending recordings from database
-	rows, err := db.Query(`
+	// Use a transaction for the database operations
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("Error starting database transaction: %v", err)
+		return
+	}
+
+	// Get all recordings from database
+	rows, err := tx.Query(`
         SELECT id, channel_id, date, start_time, duration, status
         FROM recordings
-        WHERE status = 'pending'
     `)
 	if err != nil {
 		log.Printf("Error loading recordings: %v", err)
+		tx.Rollback() //nolint: errcheck
 		return
 	}
 	defer rows.Close() //nolint: errcheck
 
-	// Get system timezone
-	loc, err := getLocalLocation()
-	if err != nil {
-		loc = time.UTC
-		log.Printf("Error loading system timezone, using UTC: %v", err)
-	}
-
 	// Process each recording
 	for rows.Next() {
-		var r Recording
+		var r types.Recording
 		if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status); err != nil {
 			log.Printf("Error scanning recording: %v", err)
 			continue
+		}
+
+		// Check if status needs to be updated
+		storageDir := os.Getenv("STORAGE_DIR")
+
+		// Check if recording time has passed
+		loc, _ := getLocalLocation()
+		newStatus := r.CheckStatus(db, loc, storageDir)
+
+		// Update status if needed
+		if r.Status != newStatus {
+			_, err := tx.Exec("UPDATE recordings SET status = ? WHERE id = ?", newStatus, r.ID)
+			if err != nil {
+				log.Printf("Error updating recording status: %v", err)
+			} else {
+				log.Printf("Updated recording %d status from %s to %s", r.ID, r.Status, newStatus)
+				r.Status = newStatus
+			}
 		}
 
 		// Parse the start time in system timezone
@@ -193,6 +225,12 @@ func loadRecordings() {
 			log.Printf("Recording %d should have started at %v", r.ID, startTime)
 		}
 	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		log.Printf("Error committing transaction: %v", err)
+		return
+	}
 }
 
 func startRecordingScheduler() {
@@ -217,9 +255,9 @@ func startRecordingScheduler() {
 				continue
 			}
 
-			var recordings []Recording
+			var recordings []types.Recording
 			for rows.Next() {
-				var r Recording
+				var r types.Recording
 				if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status); err != nil {
 					log.Printf("Error scanning recording: %v", err)
 					continue
@@ -247,68 +285,163 @@ func startRecordingScheduler() {
 	}
 }
 
-func startRecording(r Recording) {
-	// Find the channel
-	var ch Channel
-	err := db.QueryRow("SELECT guide_number, guide_name, url FROM channels WHERE guide_number = ?", r.ChannelID).Scan(
-		&ch.GuideNumber, &ch.GuideName, &ch.URL)
+func startRecording(r types.Recording) {
+	// Use a transaction for the database operations
+	tx, err := db.Begin()
 	if err != nil {
-		log.Printf("Error finding channel %s: %v", r.ChannelID, err)
+		log.Printf("Error starting database transaction: %v", err)
 		return
 	}
 
-	// Create output filename
-	outputDir := os.Getenv("STORAGE_DIR")
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		log.Printf("Error creating output directory: %v", err)
+	// Find the channel
+	var ch types.Channel
+	err = tx.QueryRow("SELECT guide_number, guide_name, url FROM channels WHERE guide_number = ?", r.ChannelID).Scan(
+		&ch.GuideNumber, &ch.GuideName, &ch.URL)
+	if err != nil {
+		log.Printf("Error finding channel %s: %v", r.ChannelID, err)
+		tx.Rollback() //nolint: errcheck
+		// Mark as failed
+		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		if err != nil {
+			log.Printf("Error updating recording status: %v", err)
+		}
 		return
 	}
-	outputFile := filepath.Join(outputDir, fmt.Sprintf("%s-%s-%s-%s.mp4",
-		r.Date, r.StartTime, ch.GuideName, ch.GuideNumber))
+
+	// Get storage directory from environment variable or use default
+	storageDir := os.Getenv("STORAGE_DIR")
+
+	// Create output directory if it doesn't exist
+	if err := os.MkdirAll(storageDir, 0755); err != nil {
+		log.Printf("Error creating output directory: %v", err)
+		tx.Rollback() //nolint: errcheck
+		// Mark as failed
+		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		if err != nil {
+			log.Printf("Error updating recording status: %v", err)
+		}
+		return
+	}
+
+	outputFile := filepath.Join(storageDir, r.GetFilePath())
 
 	// Create log file in /tmp
 	logFile := filepath.Join("/tmp", fmt.Sprintf("ffmpeg-%s-%s.log", r.Date, r.StartTime))
 	logFileHandle, err := os.Create(logFile)
 	if err != nil {
 		log.Printf("Error creating log file: %v", err)
+		tx.Rollback() //nolint: errcheck
+		// Mark as failed
+		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		if err != nil {
+			log.Printf("Error updating recording status: %v", err)
+		}
 		return
 	}
 	defer logFileHandle.Close() //nolint: errcheck
 
-	// Build ffmpeg command with duration in seconds
+	// Build ffmpeg command
 	durationSeconds := r.Duration * 60
-	cmd := exec.Command("ffmpeg",
-		"-i", ch.URL,
-		"-t", fmt.Sprintf("%d", durationSeconds),
-		"-c", "copy",
-		outputFile)
+	ffmpegArgs := buildFFmpegArgs(ch.URL, durationSeconds, outputFile)
+	cmd := exec.Command("ffmpeg", ffmpegArgs...)
+
+	// Log the command
+	log.Printf("Starting recording: %s", outputFile)
+	log.Printf("Channel: %s (%s)", ch.GuideName, ch.GuideNumber)
+	log.Printf("Date: %s, Time: %s, Duration: %d minutes", r.Date, r.StartTime, r.Duration)
+	log.Printf("Storage directory: %s", storageDir)
+	log.Printf("Log file: %s", logFile)
+	log.Printf("FFmpeg command: %s", getFFmpegCommandString(ch.URL, durationSeconds, outputFile))
 
 	// Set up logging
 	cmd.Stdout = logFileHandle
 	cmd.Stderr = logFileHandle
 
-	// Detailed logging
-	log.Printf("Starting recording: %s", outputFile)
-	log.Printf("Channel: %s (%s)", ch.GuideName, ch.GuideNumber)
-	log.Printf("Date: %s, Time: %s, Duration: %d minutes", r.Date, r.StartTime, r.Duration)
-	log.Printf("Log file: %s", logFile)
-	log.Printf("FFmpeg command: ffmpeg -i %s -t %d -c copy %s",
-		ch.URL, durationSeconds, outputFile)
-
 	// Start recording
 	if err := cmd.Run(); err != nil {
 		log.Printf("Error running ffmpeg: %v", err)
+
+		// Check if file was created despite the error
+		if _, err := os.Stat(outputFile); err == nil {
+			// File exists, mark as completed
+			_, err := tx.Exec("UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
+			if err != nil {
+				log.Printf("Error updating recording status: %v", err)
+				tx.Rollback() //nolint: errcheck
+				return
+			}
+		} else {
+			// File doesn't exist, mark as failed
+			_, err := tx.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			if err != nil {
+				log.Printf("Error updating recording status: %v", err)
+				tx.Rollback() //nolint: errcheck
+				return
+			}
+		}
+
+		// Commit the transaction
+		if err := tx.Commit(); err != nil {
+			log.Printf("Error committing transaction: %v", err)
+			return
+		}
 		return
 	}
 
 	// Update recording status
-	_, err = db.Exec("UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
+	_, err = tx.Exec("UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
 	if err != nil {
 		log.Printf("Error updating recording status: %v", err)
+		tx.Rollback() //nolint: errcheck
+		return
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		log.Printf("Error committing transaction: %v", err)
+		return
 	}
 
 	// Final log message
 	log.Printf("Recording completed successfully: %s", outputFile)
+}
+
+// buildFFmpegArgs builds the ffmpeg command arguments
+func buildFFmpegArgs(inputURL string, durationSeconds int, outputFile string) []string {
+	args := []string{
+		// Input options
+		"-i", inputURL,
+		"-fflags", "+genpts", // Generate missing pts values
+		"-analyzeduration", "100M", // Increase analysis duration
+		"-probesize", "100M", // Increase probe size
+
+		// Error handling options
+		"-ignore_io_errors", "1", // Ignore I/O errors
+		"-err_detect", "ignore_err", // Ignore errors
+		"-max_interleave_delta", "100M", // Maximum interleave delta
+
+		// Network options
+		"-rtsp_transport", "tcp", // Use TCP for more reliable transport
+		"-reconnect", "1", // Enable reconnection
+		"-reconnect_at_eof", "1", // Reconnect when stream ends
+		"-reconnect_streamed", "1", // Reconnect for streamed content
+		"-reconnect_delay_max", "60", // Maximum reconnection delay in seconds
+
+		// Output options
+		"-t", fmt.Sprintf("%d", durationSeconds),
+		"-c", "copy", // Stream copy mode
+		"-f", "mp4", // Force MP4 format
+		"-movflags", "+faststart", // Enable fast start for web streaming
+		outputFile,
+	}
+	return args
+}
+
+// getFFmpegCommandString returns a human-readable string of the ffmpeg command
+func getFFmpegCommandString(inputURL string, durationSeconds int, outputFile string) string {
+	args := buildFFmpegArgs(inputURL, durationSeconds, outputFile)
+	cmd := "ffmpeg " + strings.Join(args, " ")
+	return cmd
 }
 
 // serveHome serves the main HTML page
@@ -350,11 +483,11 @@ func getChannels(w http.ResponseWriter, r *http.Request) {
 func getRecordings(w http.ResponseWriter, r *http.Request) {
 	// Get recordings with channel information
 	rows, err := db.Query(`
-        SELECT r.id, r.channel_id, r.date, r.start_time, r.duration, r.status,
+        SELECT r.id, r.channel_id, r.date, r.start_time, r.duration, r.status, r.title,
                c.guide_number, c.guide_name
         FROM recordings r
         LEFT JOIN channels c ON r.channel_id = c.guide_number
-		  ORDER BY r.start_time
+		  ORDER BY r.date, r.start_time
     `)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -363,29 +496,31 @@ func getRecordings(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close() //nolint: errcheck
 
 	var recordings []struct {
-		ID          int    `json:"id"`
-		ChannelID   string `json:"channel_id"`
-		Date        string `json:"date"`
-		StartTime   string `json:"start_time"`
-		Duration    int    `json:"duration"`
-		Status      string `json:"status"`
-		GuideNumber string `json:"guide_number"`
-		GuideName   string `json:"guide_name"`
+		ID          int     `json:"id"`
+		ChannelID   string  `json:"channel_id"`
+		Date        string  `json:"date"`
+		StartTime   string  `json:"start_time"`
+		Duration    int     `json:"duration"`
+		Status      string  `json:"status"`
+		Title       *string `json:"title,omitempty"`
+		GuideNumber string  `json:"guide_number"`
+		GuideName   string  `json:"guide_name"`
 	}
 
 	for rows.Next() {
 		var r struct {
-			ID          int    `json:"id"`
-			ChannelID   string `json:"channel_id"`
-			Date        string `json:"date"`
-			StartTime   string `json:"start_time"`
-			Duration    int    `json:"duration"`
-			Status      string `json:"status"`
-			GuideNumber string `json:"guide_number"`
-			GuideName   string `json:"guide_name"`
+			ID          int     `json:"id"`
+			ChannelID   string  `json:"channel_id"`
+			Date        string  `json:"date"`
+			StartTime   string  `json:"start_time"`
+			Duration    int     `json:"duration"`
+			Status      string  `json:"status"`
+			Title       *string `json:"title,omitempty"`
+			GuideNumber string  `json:"guide_number"`
+			GuideName   string  `json:"guide_name"`
 		}
 		if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status,
-			&r.GuideNumber, &r.GuideName); err != nil {
+			&r.Title, &r.GuideNumber, &r.GuideName); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -414,7 +549,7 @@ func getRecordingFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get recording from database
-	var recording Recording
+	var recording types.Recording
 	var channelName string
 	err = db.QueryRow(`
         SELECT r.id, r.channel_id, r.date, r.start_time, r.duration, r.status,
@@ -444,8 +579,7 @@ func getRecordingFile(w http.ResponseWriter, r *http.Request) {
 	storageDir := os.Getenv("STORAGE_DIR")
 
 	// Construct the file path
-	filePath := filepath.Join(storageDir, fmt.Sprintf("%s-%s-%s-%s.mp4",
-		recording.Date, recording.StartTime, channelName, recording.ChannelID))
+	filePath := filepath.Join(storageDir, recording.GetFilePath())
 
 	// Check if file exists
 	fileInfo, err := os.Stat(filePath)
@@ -591,7 +725,6 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	if !exists {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
@@ -601,21 +734,30 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Use a transaction for the database operations
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
 	// Create new recording
-	recording := Recording{
+	recording := types.Recording{
 		ChannelID: req.ChannelID,
 		Date:      req.Date,
 		StartTime: req.StartTime,
 		Duration:  req.Duration,
 		Status:    "pending",
+		Title:     req.Title,
 	}
 
 	// Store in database
-	result, err := db.Exec(`
-        INSERT INTO recordings (channel_id, date, start_time, duration, status)
-        VALUES (?, ?, ?, ?, ?)
-    `, recording.ChannelID, recording.Date, recording.StartTime, recording.Duration, recording.Status)
+	result, err := tx.Exec(`
+        INSERT INTO recordings (channel_id, date, start_time, duration, status, title)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `, recording.ChannelID, recording.Date, recording.StartTime, recording.Duration, recording.Status, recording.Title)
 	if err != nil {
+		tx.Rollback() //nolint: errcheck
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{ //nolint: errcheck
@@ -627,6 +769,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	// Get the ID of the newly inserted recording
 	id, err := result.LastInsertId()
 	if err != nil {
+		tx.Rollback() //nolint: errcheck
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{ //nolint: errcheck
@@ -634,8 +777,13 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
 	recording.ID = int(id)
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
 
 	// Send to recording channel
 	recordingCh <- recording
@@ -679,4 +827,126 @@ func getLocalLocation() (*time.Location, error) {
 		return time.UTC, nil
 	}
 	return tz, nil
+}
+
+// Load the guide data from file
+func loadGuide() {
+	if _, err := os.Stat("guide.json"); os.IsNotExist(err) {
+		log.Println("No guide.json found, skipping")
+		return
+	}
+
+	file, err := os.Open("guide.json")
+	if err != nil {
+		log.Printf("Error opening guide.json: %v", err)
+		return
+	}
+	defer file.Close() //nolint: errcheck
+
+	if err := json.NewDecoder(file).Decode(&guideData); err != nil {
+		log.Printf("Error decoding guide.json: %v", err)
+	} else {
+		log.Println("Loaded guide data")
+	}
+}
+
+func setupFileWatcher(filePath string) {
+	var err error
+	watcher, err = fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer watcher.Close() //nolint: errcheck
+
+	done := make(chan bool)
+
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					log.Println("Modified file detected:", event.Name)
+					loadGuide()
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Println("Error:", err)
+			}
+		}
+	}()
+
+	err = watcher.Add(filePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	<-done
+}
+
+func getGuide(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	guideDataMutex.RLock()
+	defer guideDataMutex.RUnlock()
+
+	// Check if programs exist in guide data
+	if programs, ok := guideData["programs"].([]interface{}); ok {
+		var filteredPrograms []map[string]interface{}
+
+		now := time.Now()
+		for _, progInterface := range programs {
+			progMap, ok := progInterface.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Convert start and end times to Go time objects
+			endTimeStr, endOk := progMap["end"].(string)
+
+			if !endOk {
+				continue
+			}
+
+			endTime, err := time.Parse(time.RFC3339, endTimeStr)
+			if err != nil {
+				log.Printf("Error parsing end time: %v", err)
+				continue
+			}
+
+			// Skip programs that have already ended
+			if endTime.Before(now) {
+				continue
+			}
+
+			filteredPrograms = append(filteredPrograms, progMap)
+		}
+
+		// Sort programs by start time and channel number
+		sort.Slice(filteredPrograms, func(i, j int) bool {
+			startI := filteredPrograms[i]["start"].(string)
+			startJ := filteredPrograms[j]["start"].(string)
+			channelI := filteredPrograms[i]["channel"].(string)
+			channelJ := filteredPrograms[j]["channel"].(string)
+
+			// First sort by start time
+			if startI != startJ {
+				return startI < startJ
+			}
+			// Then sort by channel number (ascending order)
+			return channelI < channelJ
+		})
+
+		// Replace programs with sorted/filtered version in guide data
+		guideData["programs"] = filteredPrograms
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(guideData) //nolint: errcheck
 }

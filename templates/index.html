@@ -14,44 +14,73 @@
         .recording { padding: 10px; border: 1fr solid #ddd; margin: 10px 0; }
         button { padding: 8px 16px; background-color: #4CAF50; color: white; border: none; cursor: pointer; }
         button:hover { background-color: #45a049; }
+        .tab { margin-bottom: 20px; }
+        .tabs button { padding: 10px; margin-right: 5px; }
+        .content { display: none; }
+        .content.active { display: block; }
+        .program-guide table { width: 100%; border-collapse: collapse; }
+        .program-guide th, .program-guide td { border: 1px solid #ddd; padding: 8px; text-align: left; }
     </style>
 </head>
 <body>
     <h1>HDHomeRun DVR</h1>
-    <div class="calendar-controls">
-        <button onclick="previousMonth()">Previous</button>
-        <button onclick="nextMonth()">Next</button>
-        <span id="month-year">Month Year</span>
+
+    <!-- Tabs -->
+    <div class="tabs">
+        <button onclick="showTab('schedule')">Schedule Recording</button>
+        <button onclick="showTab('recordings')">Recordings</button>
+        <button onclick="showTab('programGuide')">Program Guide</button>
     </div>
 
-    <div class="calendar">
-        <div class="day header">Sun</div>
-        <div class="day header">Mon</div>
-        <div class="day header">Tue</div>
-        <div class="day header">Wed</div>
-        <div class="day header">Thu</div>
-        <div class="day header">Fri</div>
-        <div class="day header">Sat</div>
+
+    <!-- Schedule tab content -->
+    <div id="schedule" class="content active">
+        <div class="calendar-controls">
+            <button onclick="previousMonth()">Previous</button>
+            <button onclick="nextMonth()">Next</button>
+            <span id="month-year">Month Year</span>
+        </div>
+        <div class="calendar">
+            <div class="day header">Sun</div>
+            <div class="day header">Mon</div>
+            <div class="day header">Tue</div>
+            <div class="day header">Wed</div>
+            <div class="day header">Thu</div>
+            <div class="day header">Fri</div>
+            <div class="day header">Sat</div>
+        </div>
+        <div class="channel-select">
+            <label for="channel">Select Channel:</label>
+            <select id="channel">
+                <option value="">-- Select Channel --</option>
+            </select>
+        </div>
+        <div class="time-select">
+            <label for="startTime">Start Time:</label>
+            <input type="time" id="startTime">
+            <label for="duration">Duration (minutes):</label>
+            <input type="number" id="duration" min="1" max="1440" value="60">
+            <button onclick="scheduleRecording()">Schedule Recording</button>
+        </div>
     </div>
 
-    <div class="channel-select">
-        <label for="channel">Select Channel:</label>
-        <select id="channel">
-            <option value="">-- Select Channel --</option>
-        </select>
-    </div>
-
-    <div class="time-select">
-        <label for="startTime">Start Time:</label>
-        <input type="time" id="startTime">
-        <label for="duration">Duration (minutes):</label>
-        <input type="number" id="duration" min="1" max="1440" value="60">
-        <button onclick="scheduleRecording()">Schedule Recording</button>
-    </div>
-
-    <div class="recordings">
+    <!-- Recordings tab content -->
+    <div id="recordings" class="content">
         <h2>Scheduled Recordings</h2>
         <div id="recordingsList"></div>
+    </div>
+
+    <!-- Program Guide tab content -->
+    <div id="programGuide" class="content">
+        <h2>Program Guide</h2>
+        <label for="categoryFilter">Filter by category:</label>
+        <select id="categoryFilter" onchange="filterPrograms()">
+            <option value="">All</option>
+            <option value="movie">Movie</option>
+            <option value="news">News</option>
+            <option value="sports">Sports</option>
+        </select>
+        <div class="program-guide" id="programGuideList"></div>
     </div>
 
 <script>
@@ -61,18 +90,18 @@
     let currentMonth = new Date().getMonth();
     let currentYear = new Date().getFullYear();
 
-// Update the channel loading
-fetch('/api/channels')
-    .then(response => response.json())
-    .then(data => {
-        const channelSelect = document.getElementById('channel');
-        data.forEach(channel => {
-            const option = document.createElement('option');
-            option.value = channel.guideNumber;  // Use guideNumber as value
-            option.textContent = `${channel.guideNumber} - ${channel.guideName}`;
-            channelSelect.appendChild(option);
+    // Update the channel loading
+    fetch('/api/channels')
+        .then(response => response.json())
+        .then(data => {
+            const channelSelect = document.getElementById('channel');
+            data.forEach(channel => {
+                const option = document.createElement('option');
+                option.value = channel.guideNumber;  // Use guideNumber as value
+                option.textContent = `${channel.guideNumber} - ${channel.guideName}`;
+                channelSelect.appendChild(option);
+            });
         });
-    });
 
     // Generate calendar
     function generateCalendar() {
@@ -166,16 +195,16 @@ fetch('/api/channels')
             alert('Please select a date');
             return;
         }
-    
+
         const channelId = document.getElementById('channel').value;
         const startTime = document.getElementById('startTime').value;
         const duration = document.getElementById('duration').value;
-    
+
         if (!channelId || !startTime || !duration) {
             alert('Please fill in all fields');
             return;
         }
-    
+
         fetch('/api/recordings', {
             method: 'POST',
             headers: {
@@ -207,7 +236,7 @@ fetch('/api/channels')
             }
         });
     }
-   
+
    function loadRecordings() {
         fetch('/api/recordings')
             .then(response => response.json())
@@ -218,11 +247,13 @@ fetch('/api/channels')
                     const channelName = recording.guide_number ?
                         `${recording.guide_number} - ${recording.guide_name}` :
                         recording.channel_id;
-    
+
                     const div = document.createElement('div');
                     div.className = 'recording';
                     div.innerHTML = `
                         <strong>${recording.date} ${recording.start_time}</strong>
+                        <br>
+                        Title : ${recording.title}
                         <br>
                         Duration: ${recording.duration} minutes
                         <br>
@@ -238,12 +269,12 @@ fetch('/api/channels')
                 });
             });
     }
- 
+
     // Add this new function to handle downloading recordings
     function downloadRecording(id) {
         window.location.href = `/api/recordings/${id}/file`;
     }
- 
+
     // Delete recording
     function deleteRecording(id) {
         fetch(`/api/recordings/${id}`, {
@@ -254,9 +285,187 @@ fetch('/api/channels')
         });
     }
 
+   // Tab switching functions
+    function showTab(tabId) {
+        document.querySelectorAll('.content').forEach(content => {
+            content.classList.remove('active');
+        });
+        document.getElementById(tabId).classList.add('active');
+
+        if (tabId === 'programGuide') {
+            loadPrograms();
+        }
+    }
+
+    function loadPrograms() {
+        fetch('/api/guide')
+            .then(response => response.json())
+            .then(data => {
+                const programGuideList = document.getElementById('programGuideList');
+                programGuideList.innerHTML = '';
+
+                if (data.programs && Array.isArray(data.programs)) {
+                    // Create table
+                    const table = document.createElement('table');
+                    table.innerHTML = `
+                        <thead>
+                            <tr>
+                                <th>Channel</th>
+                                <th>Title</th>
+                                <th>Start Time</th>
+                                <th>Duration (min)</th>
+                                <th>Category</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="programsBody">
+                        </tbody>
+                    `;
+                    programGuideList.appendChild(table);
+
+                    function getLocalTimeStringNoTZ(date) {
+                      const month = date.getMonth().toString() + 1;
+                      const day = date.getDate().toString().padStart(2, '0');
+                      const hours = date.getHours().toString().padStart(2, '0');
+                      const minutes = date.getMinutes().toString().padStart(2, '0');
+                      return `${month}/${day} ${hours}:${minutes}`;
+                    }
+
+                    // Populate table with programs
+                    const programsBody = document.getElementById('programsBody');
+                    data.programs.forEach(program => {
+                        // Format the start time
+                        let startTime = new Date(program.start);
+                        let formattedStartTime = `${getLocalTimeStringNoTZ(startTime)}`;
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${program.channel}</td>
+                            <td>${program.title} ${program.subtitle ? ` - ${program.subtitle}` : ''}</td>
+                            <td>${formattedStartTime}</td>
+                            <td>${program.duration || 'N/A'}</td>
+                            <td>${program.category || 'N/A'}</td>
+                        `;
+                        const actionCell = document.createElement('td');
+                        const scheduleButton = document.createElement('button');
+                        scheduleButton.textContent = 'Schedule';
+                        scheduleButton.onclick = () => scheduleProgramRecording(program);
+                        actionCell.appendChild(scheduleButton);
+                        row.appendChild(actionCell);
+
+                        programsBody.appendChild(row);
+                    });
+                } else {
+                    programGuideList.textContent = 'No programs available';
+                }
+            });
+    }
+
+    function scheduleProgramRecording(program) {
+        let dateObj = new Date(program.start);
+        let formattedDate = `${dateObj.getFullYear()}-${(dateObj.getMonth()+1).toString().padStart(2,'0')}-${dateObj.getDate().toString().padStart(2,'0')}`
+        let startTime = `${dateObj.getHours().toString().padStart(2,'0')}:${dateObj.getMinutes().toString().padStart(2,'0')}`
+ 
+        fetch('/api/recordings', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                channelId: program.channel,
+                date: formattedDate,  // Use properly formatted date
+                startTime: startTime,
+                duration: program.duration,
+                title: program.title
+            })
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(err => { throw err; });
+            }
+            return response.json();
+        })
+        .then(data => {
+            alert('Recording scheduled!');
+            loadRecordings();
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            if (error.error) {
+                alert(error.error);
+            } else {
+                alert('Error scheduling recording');
+            }
+        });
+    }
+
+    // Filter programs by category
+    function filterPrograms() {
+        const selectedCategory = document.getElementById('categoryFilter').value;
+        fetch('/api/guide')
+            .then(response => response.json())
+            .then(data => {
+                if (data.programs && Array.isArray(data.programs)) {
+                    const filteredPrograms = data.programs.filter(program =>
+                        !selectedCategory || program.category === selectedCategory
+                    );
+                    renderProgramTable(filteredPrograms);
+                }
+            });
+    }
+
+    // Render programs table
+    function renderProgramTable(programs) {
+        const programGuideList = document.getElementById('programGuideList');
+        programGuideList.innerHTML = '';
+
+        if (programs.length > 0) {
+            const table = document.createElement('table');
+            table.innerHTML = `
+                <thead>
+                    <tr>
+                        <th>Channel</th>
+                        <th>Title</th>
+                        <th>Start Time</th>
+                        <th>Duration (min)</th>
+                        <th>Category</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="programsBody">
+                </tbody>
+            `;
+            programGuideList.appendChild(table);
+
+            const programsBody = document.getElementById('programsBody');
+            programs.forEach(program => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${program.channel}</td>
+                    <td>${program.title} ${program.subtitle ? ` - ${program.subtitle}` : ''}</td>
+                    <td>${program.start}</td>
+                    <td>${program.duration || 'N/A'}</td>
+                    <td>${program.category || 'N/A'}</td>
+                `;
+                const actionCell = document.createElement('td');
+                const scheduleButton = document.createElement('button');
+                scheduleButton.textContent = 'Schedule';
+                scheduleButton.onclick = () => scheduleProgramRecording(program);
+                actionCell.appendChild(scheduleButton);
+                row.appendChild(actionCell);
+
+                programsBody.appendChild(row);
+            });
+        } else {
+            programGuideList.textContent = 'No matching programs found';
+        }
+    }
+
     // Initialize
     generateCalendar();
     loadRecordings();
+
+    // Load program guide when tab is shown
+    showTab('schedule');  // Default to schedule tab on page load
 </script>
 
 </body>
