@@ -15,18 +15,26 @@
         button { padding: 8px 16px; background-color: #4CAF50; color: white; border: none; cursor: pointer; }
         button:hover { background-color: #45a049; }
         .tab { margin-bottom: 20px; }
-        .tabs button { padding: 10px; margin-right: 5px; }
+        .tabs button { padding: 8px 16px; margin-right: 10px; }
         .content { display: none; }
         .content.active { display: block; }
         .program-guide table { width: 100%; border-collapse: collapse; }
         .program-guide th, .program-guide td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+
+        /* Add margin-bottom to calendar-controls for spacing */
+        .calendar-controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px; /* Space between controls and calendar */
+        }
     </style>
 </head>
 <body>
     <h1>HDHomeRun DVR</h1>
 
     <!-- Tabs -->
-    <div class="tabs">
+    <div class="tab">
         <button onclick="showTab('schedule')">Schedule Recording</button>
         <button onclick="showTab('recordings')">Recordings</button>
         <button onclick="showTab('programGuide')">Program Guide</button>
@@ -37,8 +45,8 @@
     <div id="schedule" class="content active">
         <div class="calendar-controls">
             <button onclick="previousMonth()">Previous</button>
-            <button onclick="nextMonth()">Next</button>
             <span id="month-year">Month Year</span>
+            <button onclick="nextMonth()">Next</button>
         </div>
         <div class="calendar">
             <div class="day header">Sun</div>

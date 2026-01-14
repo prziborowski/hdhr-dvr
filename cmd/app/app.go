@@ -165,7 +165,7 @@ func loadRecordings() {
 
 	// Get all recordings from database
 	rows, err := tx.Query(`
-        SELECT id, channel_id, date, start_time, duration, status
+        SELECT id, channel_id, date, start_time, duration, status, title
         FROM recordings
     `)
 	if err != nil {
@@ -178,7 +178,7 @@ func loadRecordings() {
 	// Process each recording
 	for rows.Next() {
 		var r types.Recording
-		if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status); err != nil {
+		if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status, &r.Title); err != nil {
 			log.Printf("Error scanning recording: %v", err)
 			continue
 		}
@@ -552,13 +552,13 @@ func getRecordingFile(w http.ResponseWriter, r *http.Request) {
 	var recording types.Recording
 	var channelName string
 	err = db.QueryRow(`
-        SELECT r.id, r.channel_id, r.date, r.start_time, r.duration, r.status,
+        SELECT r.id, r.channel_id, r.date, r.start_time, r.duration, r.status, r.title
                c.guide_name
         FROM recordings r
         LEFT JOIN channels c ON r.channel_id = c.guide_number
         WHERE r.id = ?
     `, id).Scan(&recording.ID, &recording.ChannelID, &recording.Date,
-		&recording.StartTime, &recording.Duration, &recording.Status, &channelName)
+		&recording.StartTime, &recording.Duration, &recording.Status, &recording.Title, &channelName)
 
 	if err != nil {
 		if err == sql.ErrNoRows {

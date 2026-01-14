@@ -69,8 +69,7 @@ func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir strin
 		return "failed"
 	}
 
-	filePath := filepath.Join(storageDir, fmt.Sprintf("%s-%s-%s-%s.mp4",
-		r.Date, r.StartTime, channelName, r.ChannelID))
+	filePath := filepath.Join(storageDir, r.GetFilePath())
 
 	// Check if file exists
 	if _, err := os.Stat(filePath); err == nil {
@@ -87,7 +86,7 @@ func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir strin
 	}
 
 	// If recording time has passed and no file exists, mark as failed
-	if time.Now().In(loc).After(startTime.Add(time.Duration(r.Duration) * time.Minute)) {
+	if time.Now().In(loc).After(startTime.Add(time.Duration(r.Duration)*time.Minute)) && r.Status == "pending" {
 		return "failed"
 	}
 
