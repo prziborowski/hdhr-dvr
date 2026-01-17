@@ -1,5 +1,5 @@
 app
-!app/*
+!app/**
 app.sh
 *.sw?
 recordings.db
