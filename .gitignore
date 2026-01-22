@@ -3,6 +3,6 @@ app
 app.sh
 *.sw?
 recordings.db
-xmltv
-xmltv.sh
+guide
+guide.sh
 guide*json

@@ -286,21 +286,13 @@ func startRecordingScheduler() {
 }
 
 func startRecording(r types.Recording) {
-	// Use a transaction for the database operations
-	tx, err := db.Begin()
-	if err != nil {
-		log.Printf("Error starting database transaction: %v", err)
-		return
-	}
-
-	// Find the channel
+	// First transaction: validate channel exists and get its info
 	var ch types.Channel
-	err = tx.QueryRow("SELECT guide_number, guide_name, url FROM channels WHERE guide_number = ?", r.ChannelID).Scan(
+	err := db.QueryRow("SELECT guide_number, guide_name, url FROM channels WHERE guide_number = ?", r.ChannelID).Scan(
 		&ch.GuideNumber, &ch.GuideName, &ch.URL)
 	if err != nil {
 		log.Printf("Error finding channel %s: %v", r.ChannelID, err)
-		tx.Rollback() //nolint: errcheck
-		// Mark as failed
+		// Mark as failed in a separate transaction
 		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 		if err != nil {
 			log.Printf("Error updating recording status: %v", err)
@@ -310,12 +302,10 @@ func startRecording(r types.Recording) {
 
 	// Get storage directory from environment variable or use default
 	storageDir := os.Getenv("STORAGE_DIR")
-
 	// Create output directory if it doesn't exist
 	if err := os.MkdirAll(storageDir, 0755); err != nil {
 		log.Printf("Error creating output directory: %v", err)
-		tx.Rollback() //nolint: errcheck
-		// Mark as failed
+		// Mark as failed in a separate transaction
 		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 		if err != nil {
 			log.Printf("Error updating recording status: %v", err)
@@ -324,14 +314,12 @@ func startRecording(r types.Recording) {
 	}
 
 	outputFile := filepath.Join(storageDir, r.GetFilePath())
-
 	// Create log file in /tmp
 	logFile := filepath.Join("/tmp", fmt.Sprintf("ffmpeg-%s-%s.log", r.Date, r.StartTime))
 	logFileHandle, err := os.Create(logFile)
 	if err != nil {
 		log.Printf("Error creating log file: %v", err)
-		tx.Rollback() //nolint: errcheck
-		// Mark as failed
+		// Mark as failed in a separate transaction
 		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 		if err != nil {
 			log.Printf("Error updating recording status: %v", err)
@@ -357,48 +345,92 @@ func startRecording(r types.Recording) {
 	cmd.Stdout = logFileHandle
 	cmd.Stderr = logFileHandle
 
-	// Start recording
+	// Update status to "recording" in a separate transaction
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("Error starting database transaction: %v", err)
+		// Mark as failed in a separate transaction
+		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		if err != nil {
+			log.Printf("Error updating recording status: %v", err)
+		}
+		return
+	}
+
+	_, err = tx.Exec("UPDATE recordings SET status = 'recording' WHERE id = ?", r.ID)
+	if err != nil {
+		log.Printf("Error updating recording status to 'recording': %v", err)
+		tx.Rollback() //nolint: errcheck
+		tx = nil
+		// Mark as failed in a separate transaction
+		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		if err != nil {
+			log.Printf("Error updating recording status: %v", err)
+		}
+		return
+	}
+
+	// Commit the status update transaction
+	if err := tx.Commit(); err != nil {
+		log.Printf("Error committing transaction: %v", err)
+		tx = nil
+		// Mark as failed in a separate transaction
+		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		if err != nil {
+			log.Printf("Error updating recording status: %v", err)
+		}
+		return
+	}
+	tx = nil
+
+	// Start recording (no database transaction held during this operation)
 	if err := cmd.Run(); err != nil {
 		log.Printf("Error running ffmpeg: %v", err)
-
 		// Check if file was created despite the error
 		if _, err := os.Stat(outputFile); err == nil {
 			// File exists, mark as completed
-			_, err := tx.Exec("UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
+			_, err := db.Exec("UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
-				tx.Rollback() //nolint: errcheck
-				return
 			}
 		} else {
 			// File doesn't exist, mark as failed
-			_, err := tx.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
-				tx.Rollback() //nolint: errcheck
-				return
 			}
 		}
+		return
+	}
 
-		// Commit the transaction
-		if err := tx.Commit(); err != nil {
-			log.Printf("Error committing transaction: %v", err)
-			return
+	tx, err = db.Begin()
+	if err != nil {
+		log.Printf("Error starting database transaction: %v", err)
+		// Mark as failed in a separate transaction
+		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		if err != nil {
+			log.Printf("Error updating recording status: %v", err)
 		}
 		return
 	}
+	defer func() {
+		if tx != nil {
+			if err := tx.Commit(); err != nil {
+				log.Printf("Error committing transaction: %v", err)
+			}
+		}
+	}()
 
-	// Update recording status
 	_, err = tx.Exec("UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
 	if err != nil {
-		log.Printf("Error updating recording status: %v", err)
+		log.Printf("Error updating recording status to 'completed': %v", err)
 		tx.Rollback() //nolint: errcheck
-		return
-	}
-
-	// Commit the transaction
-	if err := tx.Commit(); err != nil {
-		log.Printf("Error committing transaction: %v", err)
+		tx = nil
+		// Mark as failed in a separate transaction
+		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		if err != nil {
+			log.Printf("Error updating recording status: %v", err)
+		}
 		return
 	}
 
