@@ -21,6 +21,24 @@
         .program-guide table { width: 100%; border-collapse: collapse; }
         .program-guide th, .program-guide td { border: 1px solid #ddd; padding: 8px; text-align: left; }
 
+        .download-button {
+             display: inline-block;
+             padding: 8px 16px;
+             background-color: #2196F3;
+             color: white;
+             text-decoration: none;
+             border-radius: 4px;
+             margin-right: 10px;
+             border: none;
+             cursor: pointer;
+             font-family: inherit;
+             font-size: inherit;
+         }
+
+         .download-button:hover {
+             background-color: #0b7dda;
+         }
+
         /* Add margin-bottom to calendar-controls for spacing */
         .calendar-controls {
             display: flex;
@@ -269,8 +287,9 @@
                         <br>
                         Status: ${recording.status}
                         ${recording.status === 'completed' ?
-                            `<div>Download link: <a href="/api/recordings/${recording.id}/file" target="_blank">/api/recordings/${recording.id}/file</a></div>` :
-                            ''}
+                           `<a href="/api/recordings/${recording.id}/file" class="download-button" target="_blank">Download</a>` :
+                        ''}
+
                         <button onclick="deleteRecording(${recording.id})">Delete</button>
                     `;
                     recordingsList.appendChild(div);
