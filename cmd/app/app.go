@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,11 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -37,6 +40,10 @@ var (
 	guideData      map[string]interface{}
 	guideDataMutex sync.RWMutex
 	watcher        *fsnotify.Watcher
+	// Track running ffmpeg processes
+	runningProcesses   sync.Map // key: recording ID, value: *exec.Cmd
+	shutdownInProgress bool
+	shutdownMutex      sync.Mutex
 )
 
 func initDB() (*sql.DB, error) {
@@ -98,7 +105,54 @@ func main() {
 
 	// Start server
 	log.Println("Server starting on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: r,
+	}
+
+	// Handle graceful shutdown
+	go func() {
+		// Wait for interrupt signal
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+
+		shutdownMutex.Lock()
+		if shutdownInProgress {
+			shutdownMutex.Unlock()
+			return
+		}
+		shutdownInProgress = true
+		shutdownMutex.Unlock()
+
+		log.Println("\nReceived shutdown signal...")
+
+		// Check for active recordings
+		activeCount := 0
+		runningProcesses.Range(func(key, value interface{}) bool {
+			activeCount++
+			return true
+		})
+
+		if activeCount > 0 {
+			log.Printf("WARNING: %d recording(s) in progress. Shutdown refused.", activeCount)
+			log.Println("Please wait for recordings to complete or use 'kill -9' to force terminate.")
+			shutdownMutex.Lock()
+			shutdownInProgress = false
+			shutdownMutex.Unlock()
+			return
+		}
+
+		log.Println("No active recordings. Shutting down gracefully...")
+		time.Sleep(1 * time.Second)
+
+		// Shutdown the server
+		if err := server.Shutdown(context.Background()); err != nil {
+			log.Printf("Server shutdown error: %v", err)
+		}
+	}()
+
+	log.Fatal(server.ListenAndServe())
 }
 
 func createTables() {
@@ -383,6 +437,9 @@ func startRecording(r types.Recording) {
 	}
 	tx = nil
 
+	// Track the process
+	runningProcesses.Store(r.ID, cmd)
+
 	// Start recording (no database transaction held during this operation)
 	if err := cmd.Run(); err != nil {
 		log.Printf("Error running ffmpeg: %v", err)
@@ -433,6 +490,9 @@ func startRecording(r types.Recording) {
 		}
 		return
 	}
+
+	// Remove from running processes
+	runningProcesses.Delete(r.ID)
 
 	// Final log message
 	log.Printf("Recording completed successfully: %s", outputFile)

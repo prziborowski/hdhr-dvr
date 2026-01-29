@@ -391,6 +391,10 @@
         let dateObj = new Date(program.start);
         let formattedDate = `${dateObj.getFullYear()}-${(dateObj.getMonth()+1).toString().padStart(2,'0')}-${dateObj.getDate().toString().padStart(2,'0')}`
         let startTime = `${dateObj.getHours().toString().padStart(2,'0')}:${dateObj.getMinutes().toString().padStart(2,'0')}`
+        let title = program.title;
+        if (program.subtitle) {
+            title += ` - ${program.subtitle}`;
+        }
  
         fetch('/api/recordings', {
             method: 'POST',
@@ -402,7 +406,7 @@
                 date: formattedDate,  // Use properly formatted date
                 startTime: startTime,
                 duration: program.duration,
-                title: program.title
+                title: title
             })
         })
         .then(response => {
