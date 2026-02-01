@@ -194,19 +194,26 @@ func main() {
 			continue
 		}
 
-		// Start of day in local time (12:00:00 AM)
-		startLocal := time.Now().Add(time.Duration(day) * 24 * time.Hour).Truncate(24 * time.Hour)
-		// End of day in local time (11:59:59 PM)
-		endLocal := startLocal.Add(24*time.Hour - time.Second)
+		// Calculate midnight in local time
+		now := time.Now().In(loc)
+		midnightLocal := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+		midnightLocal = midnightLocal.Add(time.Duration(day) * 24 * time.Hour)
 
 		// Convert to UTC
-		startUTC := startLocal.In(time.UTC)
-		endUTC := endLocal.In(time.UTC)
+		midnightUTC := midnightLocal.UTC()
+		endOfDayLocal := midnightLocal.Add(24*time.Hour - time.Second)
+		endOfDayUTC := endOfDayLocal.UTC()
 
 		// Format as ISO 8601 with milliseconds
-		startTime := startUTC.Format("2006-01-02T15:04:05.000Z")
-		endTime := endUTC.Format("2006-01-02T15:04:05.000Z")
-		log.Printf("Fetching data for day %s (UTC: %s to %s)", dayKey, startTime, endTime)
+		startTime := midnightUTC.Format("2006-01-02T15:04:05.000Z")
+		endTime := endOfDayUTC.Format("2006-01-02T15:04:05.000Z")
+
+		log.Printf("Fetching data for day %s (Local: %s to %s, UTC: %s to %s)",
+			dayKey,
+			midnightLocal.Format("2006-01-02T15:04:05-07:00"),
+			endOfDayLocal.Format("2006-01-02T15:04:05-07:00"),
+			startTime,
+			endTime)
 
 		// Load listing data in batches of 20 channels max
 		var listingData [][]types.ListingData
@@ -249,7 +256,7 @@ func main() {
 						SubTitle: program.Subtitle,
 						Start:    startTime.Format("2006-01-02T15:04:05-07:00"),
 						End:      endTime.Format("2006-01-02T15:04:05-07:00"),
-						Duration: program.Duration,
+						Duration: program.RunTime,
 					}
 
 					// Set category based on type
