@@ -23,6 +23,7 @@ import (
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
 
+	pkgcfg "github.com/prziborowski/hdhr-dvr/pkg/config"
 	"github.com/prziborowski/hdhr-dvr/pkg/types"
 )
 
@@ -37,6 +38,7 @@ type RecordingRequest struct {
 var (
 	db             *sql.DB
 	recordingCh    = make(chan types.Recording, 100)
+	config         *pkgcfg.Config
 	guideData      map[string]interface{}
 	guideDataMutex sync.RWMutex
 	watcher        *fsnotify.Watcher
@@ -75,6 +77,8 @@ func main() {
 	}
 	defer db.Close() //nolint: errcheck
 
+	config = pkgcfg.LoadConfig()
+
 	// Create tables if they don't exist
 	createTables()
 
@@ -83,7 +87,7 @@ func main() {
 
 	// Load guide data
 	loadGuide()
-	go setupFileWatcher("guide.json")
+	go setupFileWatcher(config.GuideFile)
 
 	// Load existing recordings
 	loadRecordings()
@@ -923,12 +927,12 @@ func getLocalLocation() (*time.Location, error) {
 
 // Load the guide data from file
 func loadGuide() {
-	if _, err := os.Stat("guide.json"); os.IsNotExist(err) {
+	if _, err := os.Stat(config.GuideFile); os.IsNotExist(err) {
 		log.Println("No guide.json found, skipping")
 		return
 	}
 
-	file, err := os.Open("guide.json")
+	file, err := os.Open(config.GuideFile)
 	if err != nil {
 		log.Printf("Error opening guide.json: %v", err)
 		return

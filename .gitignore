@@ -1,8 +1,5 @@
-app
-!app/**
-app.sh
+bin
 *.sw?
 recordings.db
-guide
-guide.sh
+config.json
 guide*json

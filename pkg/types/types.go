@@ -93,3 +93,31 @@ func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir strin
 	// Otherwise, it's still pending
 	return "pending"
 }
+
+// Guide represents the complete guide data structure
+type Guide struct {
+	Channels  []LineupData `json:"channels"`
+	Programs  []Program    `json:"programs"`
+	Generated string       `json:"generated"`
+}
+
+// LineupData represents the channel lineup data from tvtv.us
+type LineupData struct {
+	StationID       string `json:"stationId"`
+	ChannelNumber   string `json:"channelNumber"`
+	StationCallSign string `json:"stationCallSign"`
+	Logo            string `json:"logo"`
+}
+
+// ListingData represents the program listing data from tvtv.us
+type ListingData struct {
+	ProgramID string   `json:"programId"`
+	Title     string   `json:"title"`
+	Subtitle  string   `json:"subtitle"`
+	Flags     []string `json:"flags"`
+	Type      string   `json:"type"`
+	StartTime string   `json:"startTime"`
+	Start     int      `json:"start"`
+	Duration  int      `json:"duration"`
+	RunTime   int      `json:"runTime"`
+}
