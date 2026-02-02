@@ -3,5 +3,6 @@
   "lineUpID": "USA-OTA90210",
   "days": 8,
   "guideFile": "guide.json",
-  "stateFile": "guide_state.json"
+  "stateFile": "guide_state.json",
+  "storageDir": "/media/data/recordings"
 }

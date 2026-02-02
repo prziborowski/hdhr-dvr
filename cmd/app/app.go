@@ -77,7 +77,10 @@ func main() {
 	}
 	defer db.Close() //nolint: errcheck
 
-	config = pkgcfg.LoadConfig()
+	config, err = pkgcfg.LoadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
 
 	// Create tables if they don't exist
 	createTables()
@@ -241,12 +244,9 @@ func loadRecordings() {
 			continue
 		}
 
-		// Check if status needs to be updated
-		storageDir := os.Getenv("STORAGE_DIR")
-
 		// Check if recording time has passed
 		loc, _ := getLocalLocation()
-		newStatus := r.CheckStatus(db, loc, storageDir)
+		newStatus := r.CheckStatus(db, loc, config.StorageDir)
 
 		// Update status if needed
 		if r.Status != newStatus {
@@ -358,10 +358,8 @@ func startRecording(r types.Recording) {
 		return
 	}
 
-	// Get storage directory from environment variable or use default
-	storageDir := os.Getenv("STORAGE_DIR")
 	// Create output directory if it doesn't exist
-	if err := os.MkdirAll(storageDir, 0755); err != nil {
+	if err := os.MkdirAll(config.StorageDir, 0755); err != nil {
 		log.Printf("Error creating output directory: %v", err)
 		// Mark as failed in a separate transaction
 		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
@@ -371,7 +369,7 @@ func startRecording(r types.Recording) {
 		return
 	}
 
-	outputFile := filepath.Join(storageDir, r.GetFilePath())
+	outputFile := filepath.Join(config.StorageDir, r.GetFilePath())
 	// Create log file in /tmp
 	logFile := filepath.Join("/tmp", fmt.Sprintf("ffmpeg-%s-%s.log", r.Date, r.StartTime))
 	logFileHandle, err := os.Create(logFile)
@@ -395,7 +393,7 @@ func startRecording(r types.Recording) {
 	log.Printf("Starting recording: %s", outputFile)
 	log.Printf("Channel: %s (%s)", ch.GuideName, ch.GuideNumber)
 	log.Printf("Date: %s, Time: %s, Duration: %d minutes", r.Date, r.StartTime, r.Duration)
-	log.Printf("Storage directory: %s", storageDir)
+	log.Printf("Storage directory: %s", config.StorageDir)
 	log.Printf("Log file: %s", logFile)
 	log.Printf("FFmpeg command: %s", getFFmpegCommandString(ch.URL, durationSeconds, outputFile))
 
@@ -671,11 +669,8 @@ func getRecordingFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get storage directory from environment variable or use default
-	storageDir := os.Getenv("STORAGE_DIR")
-
 	// Construct the file path
-	filePath := filepath.Join(storageDir, recording.GetFilePath())
+	filePath := filepath.Join(config.StorageDir, recording.GetFilePath())
 
 	// Check if file exists
 	fileInfo, err := os.Stat(filePath)

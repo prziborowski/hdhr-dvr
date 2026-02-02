@@ -86,9 +86,9 @@ func min(a, b int) int {
 
 func main() {
 	// Load configuration
-	config := pkgcfg.LoadConfig()
-	if config.DefaultConfig {
-		log.Fatalf("Generating guide requires config.json configuration")
+	config, err := pkgcfg.LoadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
 	log.Printf("Using configuration: timezone=%s, lineUpID=%s, days=%d",

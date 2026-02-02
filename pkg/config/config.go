@@ -7,27 +7,30 @@ import (
 )
 
 type Config struct {
-	Timezone      string `json:"timezone"`
-	LineUpID      string `json:"lineUpID"`
-	Days          int    `json:"days"`
-	GuideFile     string `json:"guideFile"`
-	StateFile     string `json:"stateFile"`
-	DefaultConfig bool
+	Timezone   string `json:"timezone"`
+	LineUpID   string `json:"lineUpID"`
+	Days       int    `json:"days"`
+	GuideFile  string `json:"guideFile"`
+	StateFile  string `json:"stateFile"`
+	StorageDir string `json:"storageDir"`
 }
 
 // LoadConfig reads the configuration from config.json
-func LoadConfig() *Config {
+func LoadConfig() (*Config, error) {
 	var config Config
 
 	file, err := os.ReadFile("config.json")
 	if err != nil {
-		log.Printf("Failed to read config file: %v", err)
-		config.DefaultConfig = true
-	} else {
-		if err := json.Unmarshal(file, &config); err != nil {
-			log.Printf("Failed to unmarshal config file: %v", err)
-			config.DefaultConfig = true
-		}
+		return nil, err
+	}
+
+	if err := json.Unmarshal(file, &config); err != nil {
+		log.Printf("Failed to unmarshal config file: %v", err)
+		return nil, err
+	}
+
+	if config.StorageDir == "" {
+		log.Fatalf("storageDir cannot be unset")
 	}
 
 	if config.Timezone == "" {
@@ -43,5 +46,5 @@ func LoadConfig() *Config {
 		config.StateFile = "guide_state.json"
 	}
 
-	return &config
+	return &config, nil
 }
