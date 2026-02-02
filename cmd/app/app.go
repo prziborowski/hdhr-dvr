@@ -912,7 +912,6 @@ func deleteRecording(w http.ResponseWriter, r *http.Request) {
 func getLocalLocation() (*time.Location, error) {
 	// Try to get system timezone
 	tz, err := time.LoadLocation("America/Los_Angeles")
-	log.Printf("Using timezone %s\n", tz.String())
 	if err != nil {
 		// Fallback to UTC if system timezone can't be determined
 		return time.UTC, nil
