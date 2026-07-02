@@ -78,6 +78,20 @@
         #keywordsList li:last-child { border-bottom: none; }
         .delete-keyword-btn { background-color: #f44336; }
         .delete-keyword-btn:hover { background-color: #d32f2f; }
+        
+        /* Category badge styles */
+        .category-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            margin-left: 8px;
+            font-weight: bold;
+        }
+        .category-badge.movie { background-color: #ff9800; color: white; }
+        .category-badge.news { background-color: #2196F3; color: white; }
+        .category-badge.sports { background-color: #4CAF50; color: white; }
+        .category-badge.kids { background-color: #9C27B0; color: white; }
     </style>
 </head>
 <body>
@@ -147,6 +161,13 @@
         <h2>Manage Keywords</h2>
         <div class="add-keyword-form">
             <input type="text" id="newKeywordInput" placeholder="Enter keyword...">
+            <select id="keywordCategoryFilter">
+                <option value="">No Category Filter</option>
+                <option value="movie">Movie</option>
+                <option value="news">News</option>
+                <option value="sports">Sports</option>
+                <option value="kids">Kids</option>
+            </select>
             <button onclick="addKeyword()">Add Keyword</button>
         </div>
         <ul id="keywordsList"></ul>
@@ -566,8 +587,14 @@
                     keywords.forEach(keyword => {
                         const li = document.createElement('li');
                         
+                        // Create the keyword name with optional category badge
+                        let displayText = keyword.name || 'Unnamed Keyword';
+                        if (keyword.category) {
+                            displayText += ` <span class="category-badge ${keyword.category}">${keyword.category}</span>`;
+                        }
+                        
                         const span = document.createElement('span');
-                        span.textContent = keyword.name || 'Unnamed Keyword';
+                        span.innerHTML = displayText;
                         
                         const deleteBtn = document.createElement('button');
                         deleteBtn.textContent = 'Delete';
@@ -597,14 +624,22 @@
             return;
         }
 
+        // Get the selected category from the dropdown
+        const categorySelect = document.getElementById('keywordCategoryFilter');
+        const selectedCategory = categorySelect ? categorySelect.value : '';
+
         fetch('/api/keywords', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: keywordName })
+            body: JSON.stringify({ name: keywordName, category: selectedCategory })
         })
         .then(response => response.json())
         .then(() => {
             input.value = '';
+            // Reset the category dropdown to default after adding
+            if (categorySelect) {
+                categorySelect.value = '';
+            }
             loadKeywords();
         })
         .catch(error => console.error('Error adding keyword:', error));
