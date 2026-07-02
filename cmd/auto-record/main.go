@@ -308,12 +308,7 @@ func calculateDuration(program types.Program) int {
 }
 
 func parseProgramStartTime(program types.Program, loc *time.Location) (time.Time, error) {
-	startTimeStr := program.Start
-	if strings.HasSuffix(startTimeStr, "Z") {
-		startTimeStr = strings.TrimSuffix(startTimeStr, "Z")
-	}
-
-	t, err := time.Parse("2006-01-02T15:04:05", startTimeStr)
+	t, err := time.Parse(time.RFC3339, program.Start)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("parsing start time: %w", err)
 	}
@@ -322,12 +317,7 @@ func parseProgramStartTime(program types.Program, loc *time.Location) (time.Time
 }
 
 func parseProgramEndTime(program types.Program, loc *time.Location) (time.Time, error) {
-	endTimeStr := program.End
-	if strings.HasSuffix(endTimeStr, "Z") {
-		endTimeStr = strings.TrimSuffix(endTimeStr, "Z")
-	}
-
-	t, err := time.Parse("2006-01-02T15:04:05", endTimeStr)
+	t, err := time.Parse(time.RFC3339, program.End)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("parsing end time: %w", err)
 	}
