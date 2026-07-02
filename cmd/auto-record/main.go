@@ -246,18 +246,18 @@ func findMatchingKeyword(program types.Program, keywords []types.Keyword) string
 
 		// Check if keyword matches in title
 		matchesInTitle := strings.Contains(titleLower, keywordLower)
+		if !matchesInTitle {
+			continue
+		}
 
-		// If keyword has a category filter, check category match too
-		if keyword.Category != "" && program.Category != "" {
-			categoryMatch := strings.EqualFold(keyword.Category, program.Category)
-			if !categoryMatch {
+		// If keyword has a category filter, it MUST match the program's category
+		if keyword.Category != "" {
+			if program.Category == "" || !strings.EqualFold(keyword.Category, program.Category) {
 				continue
 			}
 		}
 
-		if matchesInTitle {
-			return keyword.Name
-		}
+		return keyword.Name
 	}
 
 	return ""
