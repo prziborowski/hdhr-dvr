@@ -68,6 +68,16 @@
              background-color: #d0d0d0;
              border-radius: 0 0 4px 4px;
          }
+
+        /* Keywords styles */
+        .keywords-container { margin-top: 20px; }
+        .add-keyword-form { margin-bottom: 20px; display: flex; gap: 10px; align-items: center; }
+        #newKeywordInput { padding: 8px; font-size: 14px; min-width: 250px; }
+        #keywordsList { list-style-type: none; padding: 0; }
+        #keywordsList li { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #eee; }
+        #keywordsList li:last-child { border-bottom: none; }
+        .delete-keyword-btn { background-color: #f44336; }
+        .delete-keyword-btn:hover { background-color: #d32f2f; }
     </style>
 </head>
 <body>
@@ -78,6 +88,7 @@
         <button onclick="showTab('schedule')">Schedule Recording</button>
         <button onclick="showTab('recordings')">Recordings</button>
         <button onclick="showTab('programGuide')">Program Guide</button>
+        <button onclick="showTab('keywords')">Keywords</button>
     </div>
 
 
@@ -129,6 +140,16 @@
             <option value="sports">Sports</option>
         </select>
         <div class="program-guide" id="programGuideList"></div>
+    </div>
+
+    <!-- Keywords tab content -->
+    <div id="keywords" class="content">
+        <h2>Manage Keywords</h2>
+        <div class="add-keyword-form">
+            <input type="text" id="newKeywordInput" placeholder="Enter keyword...">
+            <button onclick="addKeyword()">Add Keyword</button>
+        </div>
+        <ul id="keywordsList"></ul>
     </div>
 
 <script>
@@ -383,6 +404,8 @@
 
         if (tabId === 'programGuide') {
             loadPrograms();
+        } else if (tabId === 'keywords') {
+            loadKeywords();
         }
     }
 
@@ -527,6 +550,74 @@
         } else {
             programGuideList.textContent = 'No programs available';
         }
+    }
+
+    // Keywords management functions
+    function loadKeywords() {
+        fetch('/api/keywords')
+            .then(response => response.json())
+            .then(keywords => {
+                const keywordsList = document.getElementById('keywordsList');
+                if (!keywordsList) return;
+                
+                keywordsList.innerHTML = '';
+
+                if (Array.isArray(keywords) && keywords.length > 0) {
+                    keywords.forEach(keyword => {
+                        const li = document.createElement('li');
+                        
+                        const span = document.createElement('span');
+                        span.textContent = keyword.name || 'Unnamed Keyword';
+                        
+                        const deleteBtn = document.createElement('button');
+                        deleteBtn.textContent = 'Delete';
+                        deleteBtn.className = 'delete-keyword-btn';
+                        deleteBtn.onclick = () => deleteKeyword(keyword.id);
+                        
+                        li.appendChild(span);
+                        li.appendChild(deleteBtn);
+                        keywordsList.appendChild(li);
+                    });
+                } else {
+                    const li = document.createElement('li');
+                    li.textContent = 'No keywords added yet.';
+                    keywordsList.appendChild(li);
+                }
+            })
+            .catch(error => console.error('Error loading keywords:', error));
+    }
+
+    function addKeyword() {
+        const input = document.getElementById('newKeywordInput');
+        if (!input) return;
+        
+        const keywordName = input.value.trim();
+        if (!keywordName) {
+            alert('Please enter a keyword name.');
+            return;
+        }
+
+        fetch('/api/keywords', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: keywordName })
+        })
+        .then(response => response.json())
+        .then(() => {
+            input.value = '';
+            loadKeywords();
+        })
+        .catch(error => console.error('Error adding keyword:', error));
+    }
+
+    function deleteKeyword(id) {
+        if (!confirm('Are you sure you want to delete this keyword?')) return;
+
+        fetch(`/api/keywords/${id}`, {
+            method: 'DELETE'
+        })
+        .then(() => loadKeywords())
+        .catch(error => console.error('Error deleting keyword:', error));
     }
 
     // Initialize
