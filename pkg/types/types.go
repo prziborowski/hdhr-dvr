@@ -121,3 +121,10 @@ type ListingData struct {
 	Duration  int      `json:"duration"`
 	RunTime   int      `json:"runTime"`
 }
+
+// Keyword represents an auto-record keyword rule
+type Keyword struct {
+	ID        int       `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}

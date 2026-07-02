@@ -121,6 +121,10 @@ func main() {
 	r.HandleFunc("/api/recordings/{id}", deleteRecording).Methods("DELETE")
 	r.HandleFunc("/api/recordings/{id}/file", getRecordingFile).Methods("GET", "HEAD")
 	r.HandleFunc("/api/guide", getGuide).Methods("GET")
+	// Auto-record keywords routes
+	r.HandleFunc("/api/keywords", getKeywords).Methods("GET")
+	r.HandleFunc("/api/keywords", createKeyword).Methods("POST")
+	r.HandleFunc("/api/keywords/{id}", deleteKeyword).Methods("DELETE")
 
 	// Start server
 	log.Println("Server starting on :8080...")
@@ -194,6 +198,12 @@ func createTables() {
             FOREIGN KEY(channel_id) REFERENCES channels(guide_number)
         );
         CREATE INDEX IF NOT EXISTS idx_recordings_channel ON recordings(channel_id);
+
+        CREATE TABLE IF NOT EXISTS keywords (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
     `)
 	if err != nil {
 		log.Fatal(err)
@@ -1069,6 +1079,99 @@ func deleteRecording(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func getKeywords(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query("SELECT id, name, created_at FROM keywords ORDER BY created_at DESC")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close() //nolint: errcheck
+
+	var keywords []types.Keyword
+	for rows.Next() {
+		var k types.Keyword
+		if err := rows.Scan(&k.ID, &k.Name, &k.CreatedAt); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		keywords = append(keywords, k)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(keywords) //nolint: errcheck
+}
+
+func createKeyword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"}) //nolint: errcheck
+		return
+	}
+
+	if strings.TrimSpace(req.Name) == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Keyword name cannot be empty"}) //nolint: errcheck
+		return
+	}
+
+	result, err := db.Exec("INSERT INTO keywords (name) VALUES (?)", req.Name)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint") || strings.Contains(err.Error(), "duplicate") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Keyword already exists"}) //nolint: errcheck
+			return
+		}
+		log.Printf("Error creating keyword: %v", err)
+		http.Error(w, "Failed to create keyword", http.StatusInternalServerError)
+		return
+	}
+
+	id, _ := result.LastInsertId()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "name": req.Name}) //nolint: errcheck
+}
+
+func deleteKeyword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "DELETE" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	idStr := mux.Vars(r)["id"]
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "Invalid keyword ID", http.StatusBadRequest)
+		return
+	}
+
+	result, err := db.Exec("DELETE FROM keywords WHERE id = ?", id)
+	if err != nil {
+		log.Printf("Error deleting keyword: %v", err)
+		http.Error(w, "Failed to delete keyword", http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		http.Error(w, "Keyword not found", http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func getLocalLocation() (*time.Location, error) {
 	// Try to get system timezone
 	tz, err := time.LoadLocation("America/Los_Angeles")
@@ -1139,7 +1242,7 @@ func setupFileWatcher(filePath string) {
 
 func getGuide(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusNotAllowed)
 		return
 	}
 
