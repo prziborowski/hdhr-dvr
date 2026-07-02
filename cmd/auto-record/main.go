@@ -112,7 +112,7 @@ func main() {
 			matchedKeyword, program.Title, program.Category)
 
 		// Check if we already have a pending recording for this channel and time
-		if isDuplicate(pendingRecordings, program) {
+		if isDuplicate(pendingRecordings, program, loc) {
 			log.Printf("Skipping duplicate: Already scheduled for channel %s at %s",
 				program.Channel, program.Start)
 			continue
@@ -263,21 +263,24 @@ func findMatchingKeyword(program types.Program, keywords []types.Keyword) string
 	return ""
 }
 
-func isDuplicate(pendingRecordings []types.Recording, program types.Program) bool {
-	startTime, err := parseProgramStartTime(program, time.UTC)
+func isDuplicate(pendingRecordings []types.Recording, program types.Program, loc *time.Location) bool {
+	// Parse program start time and convert to UTC for comparison
+	startTimeUTC, err := parseProgramStartTime(program, time.UTC)
 	if err != nil {
 		return false
 	}
 
 	for _, rec := range pendingRecordings {
-		recTime, err := time.ParseInLocation("2006-01-02 15:04", fmt.Sprintf("%s %s", rec.Date, rec.StartTime), time.UTC)
+		// Parse recording start time using the local timezone, then convert to UTC
+		recTimeLocal, err := time.ParseInLocation("2006-01-02 15:04", fmt.Sprintf("%s %s", rec.Date, rec.StartTime), loc)
 		if err != nil {
 			continue
 		}
+		recTimeUTC := recTimeLocal.UTC()
 
 		// Check if same channel and within 30 minutes of each other
 		if strings.EqualFold(rec.ChannelID, program.Channel) {
-			diff := startTime.Sub(recTime).Minutes()
+			diff := startTimeUTC.Sub(recTimeUTC).Minutes()
 			if diff >= -30 && diff <= 30 {
 				return true
 			}
