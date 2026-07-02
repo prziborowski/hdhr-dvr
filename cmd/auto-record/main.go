@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -24,6 +22,19 @@ type RecordingRequest struct {
 	Title     *string `json:"title,omitempty"`
 }
 
+// APIResponseRecording matches the JSON structure returned by /api/recordings
+type APIResponseRecording struct {
+	ID          int     `json:"id"`
+	ChannelID   string  `json:"channel_id"`
+	Date        string  `json:"date"`
+	StartTime   string  `json:"start_time"`
+	Duration    int     `json:"duration"`
+	Status      string  `json:"status"`
+	Title       *string `json:"title,omitempty"`
+	GuideNumber string  `json:"guide_number"`
+	GuideName   string  `json:"guide_name"`
+}
+
 func main() {
 	log.Println("Starting Auto-Record...")
 
@@ -32,14 +43,10 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	db, err := initDB(config.StorageDir)
-	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
-	}
-	defer db.Close() //nolint: errcheck
+	apiBaseURL := "http://localhost:8080"
 
-	// Load keywords from database
-	keywords, err := loadKeywords(db)
+	// Load keywords via API
+	keywords, err := fetchKeywords(apiBaseURL)
 	if err != nil {
 		log.Fatalf("Failed to load keywords: %v", err)
 	}
@@ -51,8 +58,8 @@ func main() {
 
 	log.Printf("Loaded %d keywords", len(keywords))
 
-	// Load pending recordings to avoid duplicates
-	pendingRecordings, err := loadPendingRecordings(db)
+	// Load pending recordings via API to avoid duplicates
+	pendingRecordings, err := fetchPendingRecordings(apiBaseURL)
 	if err != nil {
 		log.Fatalf("Failed to load pending recordings: %v", err)
 	}
@@ -129,8 +136,8 @@ func main() {
 			title = fmt.Sprintf("%s - %s", title, program.SubTitle)
 		}
 
-		// Schedule the recording via API (using localhost:8080 as default HDHR DVR server address)
-		apiURL := "http://localhost:8080/api/recordings"
+		// Schedule the recording via API
+		apiURL := apiBaseURL + "/api/recordings"
 		err = scheduleRecording(apiURL, RecordingRequest{
 			ChannelID: program.Channel,
 			Date:      dateStr,
@@ -148,7 +155,7 @@ func main() {
 		log.Printf("Scheduled recording: %s on channel %s at %s (%d minutes)",
 			title, program.Channel, timeStr, duration)
 
-		// Add to pending recordings list to avoid duplicates
+		// Add to pending recordings list to avoid duplicates in the same run
 		pendingRecordings = append(pendingRecordings, types.Recording{
 			ChannelID: program.Channel,
 			Date:      dateStr,
@@ -159,75 +166,59 @@ func main() {
 	log.Printf("Auto-record complete. Scheduled %d new recordings.", scheduledCount)
 }
 
-func initDB(storageDir string) (*sql.DB, error) {
-	dbPath := storageDir + "/recordings.db"
-	db, err := sql.Open("sqlite3", dbPath)
+func fetchKeywords(baseURL string) ([]types.Keyword, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(baseURL + "/api/keywords")
 	if err != nil {
-		return nil, fmt.Errorf("opening database: %w", err)
+		return nil, fmt.Errorf("requesting keywords: %w", err)
 	}
+	defer resp.Body.Close() //nolint: errcheck
 
-	// Set connection pool parameters
-	db.SetMaxOpenConns(10)   // Maximum number of open connections
-	db.SetMaxIdleConns(5)    // Maximum number of idle connections
-	db.SetConnMaxLifetime(0) // No connection lifetime limit
-
-	// Test the connection
-	err = db.Ping()
-	if err != nil {
-		return nil, fmt.Errorf("pinging database: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code fetching keywords: %d", resp.StatusCode)
 	}
-
-	return db, nil
-}
-
-func loadKeywords(db *sql.DB) ([]types.Keyword, error) {
-	rows, err := db.Query("SELECT id, name, category, enabled FROM keywords WHERE enabled = 1")
-	if err != nil {
-		return nil, fmt.Errorf("querying keywords: %w", err)
-	}
-	defer rows.Close() //nolint: errcheck
 
 	var keywords []types.Keyword
-	for rows.Next() {
-		var k types.Keyword
-		var category string
-		var enabled int
-		if err := rows.Scan(&k.ID, &k.Name, &category, &enabled); err != nil {
-			return nil, fmt.Errorf("scanning keyword row: %w", err)
-		}
-		k.Category = category
-		k.Enabled = enabled == 1
-		keywords = append(keywords, k)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating keywords: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(&keywords); err != nil {
+		return nil, fmt.Errorf("decoding keywords: %w", err)
 	}
 
 	return keywords, nil
 }
 
-func loadPendingRecordings(db *sql.DB) ([]types.Recording, error) {
-	rows, err := db.Query(`SELECT channel_id, date, start_time FROM recordings WHERE status = 'pending'`)
+func fetchPendingRecordings(baseURL string) ([]types.Recording, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(baseURL + "/api/recordings")
 	if err != nil {
-		return nil, fmt.Errorf("querying pending recordings: %w", err)
+		return nil, fmt.Errorf("requesting recordings: %w", err)
 	}
-	defer rows.Close() //nolint: errcheck
+	defer resp.Body.Close() //nolint: errcheck
 
-	var recordings []types.Recording
-	for rows.Next() {
-		var r types.Recording
-		if err := rows.Scan(&r.ChannelID, &r.Date, &r.StartTime); err != nil {
-			return nil, fmt.Errorf("scanning recording row: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code fetching recordings: %d", resp.StatusCode)
+	}
+
+	var allRecordings []APIResponseRecording
+	if err := json.NewDecoder(resp.Body).Decode(&allRecordings); err != nil {
+		return nil, fmt.Errorf("decoding recordings: %w", err)
+	}
+
+	var pending []types.Recording
+	for _, r := range allRecordings {
+		if r.Status == "pending" {
+			pending = append(pending, types.Recording{
+				ID:        r.ID,
+				ChannelID: r.ChannelID,
+				Date:      r.Date,
+				StartTime: r.StartTime,
+				Duration:  r.Duration,
+				Status:    r.Status,
+				Title:     r.Title,
+			})
 		}
-		recordings = append(recordings, r)
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating recordings: %w", err)
-	}
-
-	return recordings, nil
+	return pending, nil
 }
 
 func loadGuideData(guideFile string) (*types.Guide, error) {
