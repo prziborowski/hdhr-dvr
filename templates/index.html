@@ -46,6 +46,28 @@
             align-items: center;
             margin-bottom: 20px; /* Space between controls and calendar */
         }
+
+         /* Add this to your existing style section */
+         .data-usage-display {
+              margin-bottom: 20px;
+              font-weight: bold;
+              padding: 10px;
+              background-color: #f0f0f0;
+              border-radius: 4px;
+              text-align: center;
+         }
+
+         .data-usage-display div {
+             padding: 5px;
+         }
+         .data-usage-display div:first-child {
+             background-color: #e0e0e0;
+             border-radius: 4px 4px 0 0;
+         }
+         .data-usage-display div:last-child {
+             background-color: #d0d0d0;
+             border-radius: 0 0 4px 4px;
+         }
     </style>
 </head>
 <body>
@@ -264,25 +286,65 @@
         });
     }
 
-   function loadRecordings() {
+    // Add this function before the loadRecordings function
+    function calculateDataUsage(recordings, includePending = false) {
+        const HOUR_USAGE = 4100;
+        let totalMB = 0;
+
+        recordings.forEach(recording => {
+            // Only include completed recordings for current usage
+            if (!includePending && recording.status !== 'completed') {
+                return;
+            }
+
+            // Calculate data usage for this recording
+            const durationInMinutes = recording.duration;
+            const dataUsage = (durationInMinutes / 60) * HOUR_USAGE;
+            totalMB += dataUsage;
+        });
+
+        // Convert to GB for display
+        const totalGB = totalMB / 1024;
+        return totalGB.toFixed(2);
+    }
+
+    function loadRecordings() {
         fetch('/api/recordings')
             .then(response => response.json())
             .then(data => {
                 const recordingsList = document.getElementById('recordingsList');
                 recordingsList.innerHTML = '';
+
+                // Calculate total data usage (including pending)
+                const totalDataUsage = calculateDataUsage(data, true);
+                // Calculate current data usage (completed only)
+                const currentDataUsage = calculateDataUsage(data, false);
+
+                // Create data usage display
+                const dataUsageDisplay = document.createElement('div');
+                dataUsageDisplay.className = 'data-usage-display';
+                dataUsageDisplay.innerHTML = `
+                    <div>Estimated Total Data Usage: ${totalDataUsage} GB</div>
+                    <div>Current Storage Usage: ${currentDataUsage} GB (completed recordings only)</div>
+                `;
+                recordingsList.appendChild(dataUsageDisplay);
+
                 data.forEach(recording => {
                     const channelName = recording.guide_number ?
                         `${recording.guide_number} - ${recording.guide_name}` :
                         recording.channel_id;
+
+                    // Calculate individual recording's data usage
+                    const recordingDataUsage = calculateDataUsage([recording], true);
 
                     const div = document.createElement('div');
                     div.className = 'recording';
                     div.innerHTML = `
                         <strong>${recording.date} ${recording.start_time}</strong>
                         <br>
-                        Title : ${recording.title}
+                        Title: ${recording.title || 'N/A'}
                         <br>
-                        Duration: ${recording.duration} minutes
+                        Duration: ${recording.duration} minutes (${recordingDataUsage} GB)
                         <br>
                         Channel: ${channelName}
                         <br>
@@ -290,7 +352,6 @@
                         ${recording.status === 'completed' ?
                            `<a href="/api/recordings/${recording.id}/file" class="download-button" target="_blank">Download</a>` :
                         ''}
-
                         <button onclick="deleteRecording(${recording.id})">Delete</button>
                     `;
                     recordingsList.appendChild(div);
@@ -356,6 +417,15 @@
             title += ` - ${program.subtitle}`;
         }
 
+        // Check if this is a sports program with basketball or football
+        let duration = program.duration;
+        if (program.category && program.category.toLowerCase() === 'sports') {
+            const titleLower = (program.title + ' ' + (program.subtitle || '')).toLowerCase();
+            if (titleLower.includes('basketball') || titleLower.includes('football') || titleLower.includes('fifa')) {
+                duration += 15; // Add 15 minutes
+            }
+        }
+
         fetch('/api/recordings', {
             method: 'POST',
             headers: {
@@ -363,9 +433,9 @@
             },
             body: JSON.stringify({
                 channelId: program.channel,
-                date: formattedDate,  // Use properly formatted date
+                date: formattedDate,
                 startTime: startTime,
-                duration: program.duration,
+                duration: duration,
                 title: title
             })
         })

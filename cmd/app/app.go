@@ -95,8 +95,20 @@ func main() {
 	// Load existing recordings
 	loadRecordings()
 
+	// Clean up old recordings
+	cleanupOldRecordings()
+
 	// Start recording scheduler
 	go startRecordingScheduler()
+
+	// Start periodic cleanup
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			cleanupOldRecordings()
+		}
+	}()
 
 	// Set up routes
 	r := mux.NewRouter()
@@ -223,7 +235,6 @@ func loadRecordings() {
 		log.Printf("Error starting database transaction: %v", err)
 		return
 	}
-
 	// Get all recordings from database
 	rows, err := tx.Query(`
         SELECT id, channel_id, date, start_time, duration, status, title
@@ -236,6 +247,9 @@ func loadRecordings() {
 	}
 	defer rows.Close() //nolint: errcheck
 
+	loc, _ := getLocalLocation()
+	now := time.Now().In(loc)
+
 	// Process each recording
 	for rows.Next() {
 		var r types.Recording
@@ -245,9 +259,25 @@ func loadRecordings() {
 		}
 
 		// Check if recording time has passed
-		loc, _ := getLocalLocation()
-		newStatus := r.CheckStatus(db, loc, config.StorageDir)
+		dateTimeStr := fmt.Sprintf("%s %s", r.Date, r.StartTime)
+		startTime, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
+		if err != nil {
+			log.Printf("Error parsing start time for recording %d: %v", r.ID, err)
+			continue
+		}
 
+		// Calculate end time (with pre-roll and post-roll)
+		adjustedStartTime := startTime.Add(-30 * time.Second)
+		endTime := adjustedStartTime.Add(time.Duration(r.Duration+1) * time.Minute)
+
+		// Skip if recording has already passed
+		if now.After(endTime) {
+			log.Printf("Skipping recording %d - already ended at %v", r.ID, endTime)
+			continue
+		}
+
+		// Check if recording time has passed
+		newStatus := r.CheckStatus(db, loc, config.StorageDir)
 		// Update status if needed
 		if r.Status != newStatus {
 			_, err := tx.Exec("UPDATE recordings SET status = ? WHERE id = ?", newStatus, r.ID)
@@ -259,31 +289,20 @@ func loadRecordings() {
 			}
 		}
 
-		// Parse the start time in system timezone
-		dateTimeStr := fmt.Sprintf("%s %s", r.Date, r.StartTime)
-		startTime, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
-		if err != nil {
-			log.Printf("Error parsing start time for recording %d: %v", r.ID, err)
-			continue
-		}
-
-		// Calculate end time
-		endTime := startTime.Add(time.Duration(r.Duration) * time.Minute)
-
 		// Check if recording should start now
-		now := time.Now().In(loc)
-		if now.After(startTime) && now.Before(endTime) {
+		if now.After(adjustedStartTime) && now.Before(endTime) {
 			// Recording is already in progress
 			log.Printf("Recording %d is already in progress", r.ID)
-		} else if now.Before(startTime) {
+		} else if now.Before(adjustedStartTime) {
 			// Schedule recording for later
 			recordingCh <- r
 		} else {
 			// Recording should have started already
-			log.Printf("Recording %d should have started at %v", r.ID, startTime)
+			log.Printf("Recording %d should have started at %v", r.ID, adjustedStartTime)
+			// Start it immediately
+			go startRecording(r)
 		}
 	}
-
 	// Commit the transaction
 	if err := tx.Commit(); err != nil {
 		log.Printf("Error committing transaction: %v", err)
@@ -294,7 +313,6 @@ func loadRecordings() {
 func startRecordingScheduler() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-
 	loc, err := getLocalLocation()
 	if err != nil {
 		log.Printf("Error determining timezone: %v", err)
@@ -305,14 +323,16 @@ func startRecordingScheduler() {
 		select {
 		case <-ticker.C:
 			now := time.Now().In(loc)
-
 			// Load recordings from database
-			rows, err := db.Query("SELECT id, channel_id, date, start_time, duration, status, title FROM recordings WHERE status = 'pending'")
+			rows, err := db.Query(`
+                SELECT id, channel_id, date, start_time, duration, status, title
+                FROM recordings
+                WHERE status = 'pending'
+            `)
 			if err != nil {
 				log.Printf("Error loading recordings: %v", err)
 				continue
 			}
-
 			var recordings []types.Recording
 			for rows.Next() {
 				var r types.Recording
@@ -324,16 +344,38 @@ func startRecordingScheduler() {
 			}
 			rows.Close() //nolint: errcheck
 
+			// Start a precise timer for each recording
 			for _, r := range recordings {
-				startTime, err := time.ParseInLocation("2006-01-02 15:04", fmt.Sprintf("%s %s", r.Date, r.StartTime), loc)
-				if err != nil {
-					log.Printf("Error parsing start time: %v", err)
+				// Check if this recording has already been scheduled
+				if _, exists := recordingTimers.Load(r.ID); exists {
 					continue
 				}
 
-				if now.After(startTime) && now.Before(startTime.Add(1*time.Minute)) {
-					// Start recording
+				startTime, err := time.ParseInLocation("2006-01-02 15:04", fmt.Sprintf("%s %s", r.Date, r.StartTime), loc)
+				if err != nil {
+					log.Printf("Error parsing start time for recording %d: %v", r.ID, err)
+					continue
+				}
+
+				// Calculate the actual start time (30 seconds before scheduled time)
+				actualStartTime := startTime.Add(-30 * time.Second)
+
+				// Only schedule if the recording hasn't already started
+				if now.Before(actualStartTime) {
+					// Start a precise timer for this recording
+					go startRecordingTimer(r, actualStartTime)
+				} else if now.Before(startTime.Add(time.Duration(r.Duration) * time.Minute)) {
+					// Recording should have started already, start it immediately
+					log.Printf("Recording %d should have started at %v, starting now", r.ID, actualStartTime)
 					go startRecording(r)
+				} else {
+					// Recording time has passed, mark as failed
+					log.Printf("Recording %d should have started at %v but it's now %v, marking as failed",
+						r.ID, actualStartTime, now)
+					_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+					if err != nil {
+						log.Printf("Error updating recording status: %v", err)
+					}
 				}
 			}
 		case <-recordingCh:
@@ -343,8 +385,44 @@ func startRecordingScheduler() {
 	}
 }
 
+// Track active recording timers
+var recordingTimers sync.Map // key: recording ID, value: struct{}
+
+// startRecordingTimer starts a precise timer for a recording
+func startRecordingTimer(r types.Recording, startTime time.Time) {
+	// Mark this recording as having a timer
+	recordingTimers.Store(r.ID, struct{}{})
+	defer recordingTimers.Delete(r.ID)
+
+	// Calculate time until recording should start
+	duration := time.Until(startTime)
+
+	// If the recording should start very soon, just wait the remaining time
+	if duration > 0 {
+		time.Sleep(duration)
+	}
+
+	// Check if the recording still exists and hasn't been deleted
+	var exists bool
+	err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM recordings WHERE id = ? AND status = 'pending')", r.ID).Scan(&exists)
+	if err != nil {
+		log.Printf("Error checking if recording %d exists: %v", r.ID, err)
+		return
+	}
+
+	if !exists {
+		log.Printf("Recording %d was deleted before start time, not starting", r.ID)
+		return
+	}
+
+	// Start the recording
+	log.Printf("Starting recording %d at %v (scheduled for %v)",
+		r.ID, time.Now(), startTime.Add(30*time.Second))
+	go startRecording(r)
+}
+
 func startRecording(r types.Recording) {
-	// First transaction: validate channel exists and get its info
+	// First check: validate channel exists and get its info
 	var ch types.Channel
 	err := db.QueryRow("SELECT guide_number, guide_name, url FROM channels WHERE guide_number = ?", r.ChannelID).Scan(
 		&ch.GuideNumber, &ch.GuideName, &ch.URL)
@@ -358,6 +436,33 @@ func startRecording(r types.Recording) {
 		return
 	}
 
+	// Get local timezone
+	loc, err := getLocalLocation()
+	if err != nil {
+		log.Printf("Error determining timezone: %v", err)
+		loc = time.UTC
+	}
+
+	// Parse the original start time
+	dateTimeStr := fmt.Sprintf("%s %s", r.Date, r.StartTime)
+	startTime, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
+	if err != nil {
+		log.Printf("Error parsing start time: %v", err)
+		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		if err != nil {
+			log.Printf("Error updating recording status: %v", err)
+		}
+		return
+	}
+
+	// Adjust start time by subtracting 30 seconds
+	adjustedStartTime := startTime.Add(-30 * time.Second)
+	// Adjust duration by adding 30 seconds
+	adjustedDuration := r.Duration + 1 // Adding 1 minute total (30s pre + 30s post)
+
+	log.Printf("Original start time: %v, Adjusted start time: %v, Original duration: %d, Adjusted duration: %d",
+		startTime, adjustedStartTime, r.Duration, adjustedDuration)
+
 	// Create output directory if it doesn't exist
 	if err := os.MkdirAll(config.StorageDir, 0755); err != nil {
 		log.Printf("Error creating output directory: %v", err)
@@ -369,8 +474,9 @@ func startRecording(r types.Recording) {
 		return
 	}
 
+	// Use the original start time for the filename to maintain consistency with schedule
 	outputFile := filepath.Join(config.StorageDir, r.GetFilePath())
-	// Create log file in /tmp
+	// Create log file in /tmp using original time
 	logFile := filepath.Join("/tmp", fmt.Sprintf("ffmpeg-%s-%s.log", r.Date, r.StartTime))
 	logFileHandle, err := os.Create(logFile)
 	if err != nil {
@@ -384,15 +490,16 @@ func startRecording(r types.Recording) {
 	}
 	defer logFileHandle.Close() //nolint: errcheck
 
-	// Build ffmpeg command
-	durationSeconds := r.Duration * 60
+	// Build ffmpeg command with adjusted duration
+	durationSeconds := adjustedDuration * 60
 	ffmpegArgs := buildFFmpegArgs(ch.URL, durationSeconds, outputFile)
 	cmd := exec.Command("ffmpeg", ffmpegArgs...)
 
 	// Log the command
 	log.Printf("Starting recording: %s", outputFile)
 	log.Printf("Channel: %s (%s)", ch.GuideName, ch.GuideNumber)
-	log.Printf("Date: %s, Time: %s, Duration: %d minutes", r.Date, r.StartTime, r.Duration)
+	log.Printf("Original Date: %s, Original Time: %s, Adjusted Time: %v, Duration: %d minutes (original: %d)",
+		r.Date, r.StartTime, adjustedStartTime.Format("15:04"), adjustedDuration, r.Duration)
 	log.Printf("Storage directory: %s", config.StorageDir)
 	log.Printf("Log file: %s", logFile)
 	log.Printf("FFmpeg command: %s", getFFmpegCommandString(ch.URL, durationSeconds, outputFile))
@@ -402,46 +509,72 @@ func startRecording(r types.Recording) {
 	cmd.Stderr = logFileHandle
 
 	// Update status to "recording" in a separate transaction
-	tx, err := db.Begin()
-	if err != nil {
-		log.Printf("Error starting database transaction: %v", err)
-		// Mark as failed in a separate transaction
-		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+	// Use a retry mechanism for database operations
+	var updateErr error
+	retryCount := 0
+	maxRetries := 3
+	for retryCount < maxRetries {
+		tx, err := db.Begin()
 		if err != nil {
-			log.Printf("Error updating recording status: %v", err)
+			log.Printf("Error starting database transaction: %v", err)
+			retryCount++
+			if retryCount < maxRetries {
+				time.Sleep(100 * time.Millisecond) // Wait before retry
+				continue
+			}
+			// Mark as failed in a separate transaction
+			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			if err != nil {
+				log.Printf("Error updating recording status: %v", err)
+			}
+			return
 		}
-		return
+
+		_, err = tx.Exec("UPDATE recordings SET status = 'recording' WHERE id = ?", r.ID)
+		if err != nil {
+			log.Printf("Error updating recording status to 'recording': %v", err)
+			tx.Rollback() //nolint: errcheck
+			tx = nil
+			retryCount++
+			if retryCount < maxRetries {
+				time.Sleep(100 * time.Millisecond) // Wait before retry
+				continue
+			}
+			// Mark as failed in a separate transaction
+			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			if err != nil {
+				log.Printf("Error updating recording status: %v", err)
+			}
+			return
+		}
+
+		// Commit the status update transaction
+		if err := tx.Commit(); err != nil {
+			log.Printf("Error committing transaction: %v", err)
+			tx = nil
+			retryCount++
+			if retryCount < maxRetries {
+				time.Sleep(100 * time.Millisecond) // Wait before retry
+				continue
+			}
+			// Mark as failed in a separate transaction
+			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			if err != nil {
+				log.Printf("Error updating recording status: %v", err)
+			}
+			return
+		}
+		tx = nil
+		updateErr = nil
+		break
 	}
 
-	_, err = tx.Exec("UPDATE recordings SET status = 'recording' WHERE id = ?", r.ID)
-	if err != nil {
-		log.Printf("Error updating recording status to 'recording': %v", err)
-		tx.Rollback() //nolint: errcheck
-		tx = nil
-		// Mark as failed in a separate transaction
-		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
-		if err != nil {
-			log.Printf("Error updating recording status: %v", err)
-		}
+	if updateErr != nil {
 		return
 	}
-
-	// Commit the status update transaction
-	if err := tx.Commit(); err != nil {
-		log.Printf("Error committing transaction: %v", err)
-		tx = nil
-		// Mark as failed in a separate transaction
-		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
-		if err != nil {
-			log.Printf("Error updating recording status: %v", err)
-		}
-		return
-	}
-	tx = nil
 
 	// Track the process
 	runningProcesses.Store(r.ID, cmd)
-
 	// Start recording (no database transaction held during this operation)
 	if err := cmd.Run(); err != nil {
 		log.Printf("Error running ffmpeg: %v", err)
@@ -462,40 +595,65 @@ func startRecording(r types.Recording) {
 		return
 	}
 
-	tx, err = db.Begin()
-	if err != nil {
-		log.Printf("Error starting database transaction: %v", err)
-		// Mark as failed in a separate transaction
-		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+	// Update status to "completed" with retry logic
+	retryCount = 0
+	for retryCount < maxRetries {
+		tx, err := db.Begin()
 		if err != nil {
-			log.Printf("Error updating recording status: %v", err)
-		}
-		return
-	}
-	defer func() {
-		if tx != nil {
-			if err := tx.Commit(); err != nil {
-				log.Printf("Error committing transaction: %v", err)
+			log.Printf("Error starting database transaction: %v", err)
+			retryCount++
+			if retryCount < maxRetries {
+				time.Sleep(100 * time.Millisecond) // Wait before retry
+				continue
 			}
+			// Mark as failed in a separate transaction
+			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			if err != nil {
+				log.Printf("Error updating recording status: %v", err)
+			}
+			return
 		}
-	}()
 
-	_, err = tx.Exec("UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
-	if err != nil {
-		log.Printf("Error updating recording status to 'completed': %v", err)
-		tx.Rollback() //nolint: errcheck
-		tx = nil
-		// Mark as failed in a separate transaction
-		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		_, err = tx.Exec("UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
 		if err != nil {
-			log.Printf("Error updating recording status: %v", err)
+			log.Printf("Error updating recording status to 'completed': %v", err)
+			tx.Rollback() //nolint: errcheck
+			tx = nil
+			retryCount++
+			if retryCount < maxRetries {
+				time.Sleep(100 * time.Millisecond) // Wait before retry
+				continue
+			}
+			// Mark as failed in a separate transaction
+			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			if err != nil {
+				log.Printf("Error updating recording status: %v", err)
+			}
+			return
 		}
-		return
+
+		// Commit the status update transaction
+		if err := tx.Commit(); err != nil {
+			log.Printf("Error committing transaction: %v", err)
+			tx = nil
+			retryCount++
+			if retryCount < maxRetries {
+				time.Sleep(100 * time.Millisecond) // Wait before retry
+				continue
+			}
+			// Mark as failed in a separate transaction
+			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			if err != nil {
+				log.Printf("Error updating recording status: %v", err)
+			}
+			return
+		}
+		tx = nil
+		break
 	}
 
 	// Remove from running processes
 	runningProcesses.Delete(r.ID)
-
 	// Final log message
 	log.Printf("Recording completed successfully: %s", outputFile)
 }
@@ -890,7 +1048,6 @@ func deleteRecording(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 	// Extract ID from URL
 	idStr := r.URL.Path[len("/api/recordings/"):]
 	id, err := strconv.Atoi(idStr)
@@ -905,6 +1062,9 @@ func deleteRecording(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Clean up any active timer for this recording
+	recordingTimers.Delete(id)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1039,4 +1199,63 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(guideData) //nolint: errcheck
+}
+
+func cleanupOldRecordings() {
+	log.Println("Cleaning up old recordings")
+	loc, err := getLocalLocation()
+	if err != nil {
+		log.Printf("Error determining timezone: %v", err)
+		loc = time.UTC
+	}
+
+	// Get all pending recordings
+	rows, err := db.Query(`
+        SELECT id, date, start_time, duration
+        FROM recordings
+        WHERE status = 'pending'
+    `)
+	if err != nil {
+		log.Printf("Error loading recordings for cleanup: %v", err)
+		return
+	}
+	defer rows.Close() //nolint: errcheck
+
+	now := time.Now().In(loc)
+	updatedCount := 0
+
+	for rows.Next() {
+		var id int
+		var date, startTime string
+		var duration int
+		if err := rows.Scan(&id, &date, &startTime, &duration); err != nil {
+			log.Printf("Error scanning recording: %v", err)
+			continue
+		}
+
+		// Parse the start time
+		dateTimeStr := fmt.Sprintf("%s %s", date, startTime)
+		startTimeParsed, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
+		if err != nil {
+			log.Printf("Error parsing start time for recording %d: %v", id, err)
+			continue
+		}
+
+		// Calculate end time (with pre-roll and post-roll)
+		adjustedStartTime := startTimeParsed.Add(-30 * time.Second)
+		endTime := adjustedStartTime.Add(time.Duration(duration+1) * time.Minute)
+
+		// If recording has passed, mark as failed
+		if now.After(endTime) {
+			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", id)
+			if err != nil {
+				log.Printf("Error updating recording %d status to failed: %v", id, err)
+			} else {
+				log.Printf("Marked recording %d as failed (ended at %v)", id, endTime)
+				updatedCount++
+			}
+		}
+	}
+
+	log.Printf("Cleaned up %d old recordings", updatedCount)
 }
