@@ -202,6 +202,8 @@ func createTables() {
         CREATE TABLE IF NOT EXISTS keywords (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
+            category TEXT DEFAULT '',
+            enabled INTEGER DEFAULT 1,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     `)
@@ -1080,7 +1082,7 @@ func deleteRecording(w http.ResponseWriter, r *http.Request) {
 }
 
 func getKeywords(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT id, name, created_at FROM keywords ORDER BY created_at DESC")
+	rows, err := db.Query("SELECT id, name, category, enabled, created_at FROM keywords ORDER BY created_at DESC")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1090,10 +1092,14 @@ func getKeywords(w http.ResponseWriter, r *http.Request) {
 	var keywords []types.Keyword
 	for rows.Next() {
 		var k types.Keyword
-		if err := rows.Scan(&k.ID, &k.Name, &k.CreatedAt); err != nil {
+		var category string
+		var enabled int
+		if err := rows.Scan(&k.ID, &k.Name, &category, &enabled, &k.CreatedAt); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		k.Category = category
+		k.Enabled = enabled == 1
 		keywords = append(keywords, k)
 	}
 
@@ -1108,7 +1114,9 @@ func createKeyword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Name string `json:"name"`
+		Name     string `json:"name"`
+		Category string `json:"category,omitempty"`
+		Enabled  *bool  `json:"enabled,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1124,7 +1132,12 @@ func createKeyword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := db.Exec("INSERT INTO keywords (name) VALUES (?)", req.Name)
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	result, err := db.Exec("INSERT INTO keywords (name, category, enabled) VALUES (?, ?, ?)", req.Name, req.Category, enabled)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") || strings.Contains(err.Error(), "duplicate") {
 			w.Header().Set("Content-Type", "application/json")
@@ -1140,7 +1153,7 @@ func createKeyword(w http.ResponseWriter, r *http.Request) {
 	id, _ := result.LastInsertId()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "name": req.Name}) //nolint: errcheck
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "name": req.Name, "category": req.Category}) //nolint: errcheck
 }
 
 func deleteKeyword(w http.ResponseWriter, r *http.Request) {
