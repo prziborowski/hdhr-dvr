@@ -113,8 +113,14 @@ func main() {
 	// Set up routes
 	r := mux.NewRouter()
 
-	// Routes
+	// Page routes (All serve the same index.html for SPA routing)
 	r.HandleFunc("/", serveHome).Methods("GET", "HEAD")
+	r.HandleFunc("/schedule", serveHome).Methods("GET", "HEAD")
+	r.HandleFunc("/recordings", serveHome).Methods("GET", "HEAD")
+	r.HandleFunc("/guide", serveHome).Methods("GET", "HEAD")
+	r.HandleFunc("/keywords", serveHome).Methods("GET", "HEAD")
+
+	// API Routes
 	r.HandleFunc("/api/channels", getChannels).Methods("GET")
 	r.HandleFunc("/api/recordings", getRecordings).Methods("GET")
 	r.HandleFunc("/api/recordings", createRecording).Methods("POST")
@@ -1061,7 +1067,7 @@ func deleteRecording(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Extract ID from URL
-	idStr := r.URL.Path[len("/api/recordings/"):]
+	idStr := mux.Vars(r)["id"]
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, "Invalid recording ID", http.StatusBadRequest)

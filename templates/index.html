@@ -94,15 +94,15 @@
         .category-badge.kids { background-color: #9C27B0; color: white; }
     </style>
 </head>
-<body>
+<body onload="initRoute()">
     <h1>HDHomeRun DVR</h1>
 
     <!-- Tabs -->
     <div class="tab">
-        <button onclick="showTab('schedule')">Schedule Recording</button>
-        <button onclick="showTab('recordings')">Recordings</button>
-        <button onclick="showTab('programGuide')">Program Guide</button>
-        <button onclick="showTab('keywords')">Keywords</button>
+        <button onclick="showTab('schedule', '/schedule')">Schedule Recording</button>
+        <button onclick="showTab('recordings', '/recordings')">Recordings</button>
+        <button onclick="showTab('programGuide', '/guide')">Program Guide</button>
+        <button onclick="showTab('keywords', '/keywords')">Keywords</button>
     </div>
 
 
@@ -417,17 +417,58 @@
     }
 
    // Tab switching functions
-    function showTab(tabId) {
+    function showTab(tabId, path = null) {
         document.querySelectorAll('.content').forEach(content => {
             content.classList.remove('active');
         });
         document.getElementById(tabId).classList.add('active');
 
+        if (path) {
+            history.pushState({ tabId }, '', path);
+        }
+
         if (tabId === 'programGuide') {
             loadPrograms();
         } else if (tabId === 'keywords') {
             loadKeywords();
+        } else if (tabId === 'recordings') {
+            loadRecordings();
         }
+    }
+
+    function initRoute() {
+        const path = window.location.pathname;
+        if (path === '/recordings') {
+            showTab('recordings');
+        } else if (path === '/guide') {
+            showTab('programGuide');
+        } else if (path === '/keywords') {
+            showTab('keywords');
+        } else if (path === '/schedule' || path === '/') {
+            showTab('schedule');
+        }
+
+        // Handle browser back/forward buttons
+        window.onpopstate = function(event) {
+            if (event.state && event.state.tabId) {
+                const tabId = event.state.tabId;
+                document.querySelectorAll('.content').forEach(content => {
+                    content.classList.remove('active');
+                });
+                document.getElementById(tabId).classList.add('active');
+
+                if (tabId === 'programGuide') {
+                    loadPrograms();
+                } else if (tabId === 'keywords') {
+                    loadKeywords();
+                } else if (tabId === 'recordings') {
+                    loadRecordings();
+                }
+            } else {
+                // Default to schedule for home page or when state is empty
+                initRoute(); 
+            }
+        };
     }
 
     function loadPrograms() {
@@ -659,8 +700,6 @@
     generateCalendar();
     loadRecordings();
 
-    // Load program guide when tab is shown
-    showTab('schedule');  // Default to schedule tab on page load
 </script>
 
 </body>
