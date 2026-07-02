@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -128,8 +129,9 @@ func main() {
 			title = fmt.Sprintf("%s - %s", title, program.SubTitle)
 		}
 
-		// Schedule the recording via API
-		err = scheduleRecording(config.StorageDir+"/api/recordings", RecordingRequest{
+		// Schedule the recording via API (using localhost:8080 as default HDHR DVR server address)
+		apiURL := "http://localhost:8080/api/recordings"
+		err = scheduleRecording(apiURL, RecordingRequest{
 			ChannelID: program.Channel,
 			Date:      dateStr,
 			StartTime: timeStr,
@@ -159,13 +161,29 @@ func main() {
 
 func initDB(storageDir string) (*sql.DB, error) {
 	dbPath := storageDir + "/recordings.db"
-	return sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening database: %w", err)
+	}
+
+	// Set connection pool parameters
+	db.SetMaxOpenConns(10)   // Maximum number of open connections
+	db.SetMaxIdleConns(5)    // Maximum number of idle connections
+	db.SetConnMaxLifetime(0) // No connection lifetime limit
+
+	// Test the connection
+	err = db.Ping()
+	if err != nil {
+		return nil, fmt.Errorf("pinging database: %w", err)
+	}
+
+	return db, nil
 }
 
 func loadKeywords(db *sql.DB) ([]types.Keyword, error) {
 	rows, err := db.Query("SELECT id, name, category, enabled FROM keywords WHERE enabled = 1")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("querying keywords: %w", err)
 	}
 	defer rows.Close() //nolint: errcheck
 
@@ -173,20 +191,26 @@ func loadKeywords(db *sql.DB) ([]types.Keyword, error) {
 	for rows.Next() {
 		var k types.Keyword
 		var category string
-		if err := rows.Scan(&k.ID, &k.Name, &category, &k.Enabled); err != nil {
-			return nil, err
+		var enabled int
+		if err := rows.Scan(&k.ID, &k.Name, &category, &enabled); err != nil {
+			return nil, fmt.Errorf("scanning keyword row: %w", err)
 		}
 		k.Category = category
+		k.Enabled = enabled == 1
 		keywords = append(keywords, k)
 	}
 
-	return keywords, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating keywords: %w", err)
+	}
+
+	return keywords, nil
 }
 
 func loadPendingRecordings(db *sql.DB) ([]types.Recording, error) {
 	rows, err := db.Query(`SELECT channel_id, date, start_time FROM recordings WHERE status = 'pending'`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("querying pending recordings: %w", err)
 	}
 	defer rows.Close() //nolint: errcheck
 
@@ -194,12 +218,16 @@ func loadPendingRecordings(db *sql.DB) ([]types.Recording, error) {
 	for rows.Next() {
 		var r types.Recording
 		if err := rows.Scan(&r.ChannelID, &r.Date, &r.StartTime); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scanning recording row: %w", err)
 		}
 		recordings = append(recordings, r)
 	}
 
-	return recordings, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating recordings: %w", err)
+	}
+
+	return recordings, nil
 }
 
 func loadGuideData(guideFile string) (*types.Guide, error) {
@@ -322,13 +350,14 @@ func scheduleRecording(apiURL string, req RecordingRequest) error {
 		return fmt.Errorf("marshaling request: %w", err)
 	}
 
-	resp, err := http.Post(
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(
 		apiURL,
 		"application/json",
 		bytes.NewBuffer(body),
 	)
 	if err != nil {
-		return fmt.Errorf("sending request: %w", err)
+		return fmt.Errorf("sending request to %s: %w", apiURL, err)
 	}
 	defer resp.Body.Close() //nolint: errcheck
 
