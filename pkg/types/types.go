@@ -19,7 +19,6 @@ type Channel struct {
 	URL            string `json:"URL"`
 }
 
-// Program represents a TV program
 type Program struct {
 	Channel  string `json:"channel"`
 	Title    string `json:"title"`
@@ -60,7 +59,6 @@ func (r *Recording) GetFilePath() string {
 	return outputFile
 }
 
-// First, let's update the Recording struct to include a method for checking status
 func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir string) string {
 	// Construct the expected file path
 	var channelName string
@@ -71,37 +69,36 @@ func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir strin
 
 	filePath := filepath.Join(storageDir, r.GetFilePath())
 
-	// Check if file exists
+	// Check if file exists and is valid
 	if _, err := os.Stat(filePath); err == nil {
 		return "completed"
-	} else if !os.IsNotExist(err) {
-		// Other error occurred
-		return "failed"
 	}
 
+	// Calculate end time (with pre-roll)
 	dateTimeStr := fmt.Sprintf("%s %s", r.Date, r.StartTime)
 	startTime, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
 	if err != nil {
 		return "failed"
 	}
 
-	// If recording time has passed and no file exists, mark as failed
-	if time.Now().In(loc).After(startTime.Add(time.Duration(r.Duration)*time.Minute)) && r.Status == "pending" {
-		return "failed"
+	endTime := startTime.Add(time.Duration(r.Duration+1) * time.Minute) // +1 for pre-roll
+	now := time.Now().In(loc)
+
+	if now.Before(startTime) {
+		return "pending"
+	} else if now.Before(endTime) {
+		return "recording"
 	}
 
-	// Otherwise, it's still pending
-	return "pending"
+	return "failed"
 }
 
-// Guide represents the complete guide data structure
 type Guide struct {
 	Channels  []LineupData `json:"channels"`
 	Programs  []Program    `json:"programs"`
 	Generated string       `json:"generated"`
 }
 
-// LineupData represents the channel lineup data from tvtv.us
 type LineupData struct {
 	StationID       string `json:"stationId"`
 	ChannelNumber   string `json:"channelNumber"`
@@ -109,7 +106,6 @@ type LineupData struct {
 	Logo            string `json:"logo"`
 }
 
-// ListingData represents the program listing data from tvtv.us
 type ListingData struct {
 	ProgramID string   `json:"programId"`
 	Title     string   `json:"title"`
@@ -122,9 +118,10 @@ type ListingData struct {
 	RunTime   int      `json:"runTime"`
 }
 
-// Keyword represents an auto-record keyword rule
 type Keyword struct {
 	ID        int       `json:"id"`
 	Name      string    `json:"name"`
+	Category  string    `json:"category,omitempty"`
+	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 }
