@@ -94,18 +94,6 @@ func main() {
 	log.Printf("Using configuration: timezone=%s, lineUpID=%s, days=%d",
 		config.Timezone, config.LineUpID, config.Days)
 
-	// Load previous state if it exists
-	var processedDays map[string]bool
-	stateData, err := os.ReadFile(config.StateFile)
-	if err == nil {
-		json.Unmarshal(stateData, &processedDays) //nolint: errcheck
-	} else if !os.IsNotExist(err) {
-		log.Printf("Error reading state file: %v", err)
-	}
-	if processedDays == nil {
-		processedDays = make(map[string]bool)
-	}
-
 	// Load existing guide data if it exists
 	var existingGuide types.Guide
 	existingData, err := os.ReadFile(config.GuideFile)
@@ -180,12 +168,6 @@ func main() {
 	// Process each day
 	for day := 0; day < config.Days; day++ {
 		dayKey := time.Now().Add(time.Duration(day) * 24 * time.Hour).Format("2006-01-02")
-
-		// Skip if we've already processed this day
-		if processedDays[dayKey] {
-			log.Printf("Skipping already processed day: %s", dayKey)
-			continue
-		}
 
 		// Calculate day boundaries in local time
 		loc, err := time.LoadLocation(config.Timezone)
@@ -288,22 +270,30 @@ func main() {
 			}
 		}
 
-		// Mark this day as processed
-		processedDays[dayKey] = true
 		log.Printf("Processed day: %s", dayKey)
 	}
 
-	// Combine with existing programs
-	var allPrograms []types.Program
+	// Use a map to handle deduplication and updates (Prefer new data over existing)
+	progMap := make(map[string]types.Program)
 
-	if len(existingGuide.Programs) > 0 {
-		allPrograms = append(allPrograms, existingGuide.Programs...)
+	// Add existing programs first
+	for _, p := range existingGuide.Programs {
+		key := fmt.Sprintf("%s-%s", p.Start, p.Channel)
+		progMap[key] = p
 	}
 
-	// Add new programs
-	allPrograms = append(allPrograms, newPrograms...)
+	// Overwrite with new programs (this updates titles/subtitles if they changed)
+	for _, p := range newPrograms {
+		key := fmt.Sprintf("%s-%s", p.Start, p.Channel)
+		progMap[key] = p
+	}
 
-	// Sort and remove duplicates
+	var allPrograms []types.Program
+	for _, p := range progMap {
+		allPrograms = append(allPrograms, p)
+	}
+
+	// Sort programs by start time and channel
 	sort.SliceStable(allPrograms, func(i, j int) bool {
 		if allPrograms[i].Start == allPrograms[j].Start {
 			return allPrograms[i].Channel < allPrograms[j].Channel
@@ -311,21 +301,10 @@ func main() {
 		return allPrograms[i].Start < allPrograms[j].Start
 	})
 
-	// Remove duplicates (based on start time and channel)
-	seen := make(map[string]bool)
-	var uniquePrograms []types.Program
-	for _, prog := range allPrograms {
-		key := fmt.Sprintf("%s-%s", prog.Start, prog.Channel)
-		if !seen[key] {
-			seen[key] = true
-			uniquePrograms = append(uniquePrograms, prog)
-		}
-	}
-
 	// Remove programs that have already ended
 	currentTime := time.Now()
 	var filteredPrograms []types.Program
-	for _, prog := range uniquePrograms {
+	for _, prog := range allPrograms {
 		// Parse the start time
 		startTime, err := time.Parse("2006-01-02T15:04:05-07:00", prog.Start)
 		if err != nil {
@@ -354,14 +333,6 @@ func main() {
 	}
 	if err := os.WriteFile(config.GuideFile, outputData, 0644); err != nil {
 		log.Fatalf("Error writing output file: %v", err)
-	}
-
-	// Save state
-	stateData, err = json.Marshal(processedDays)
-	if err != nil {
-		log.Printf("Error saving state: %v", err)
-	} else {
-		os.WriteFile(config.StateFile, stateData, 0644) //nolint: errcheck
 	}
 
 	log.Printf("Successfully generated %s", config.GuideFile)
