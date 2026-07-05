@@ -118,6 +118,55 @@ type ListingData struct {
 	RunTime   int      `json:"runTime"`
 }
 
+// TitanTV API Response Types
+
+type TitanTVChannel struct {
+	ChannelID    string `json:"channelId"`
+	MajorChannel string `json:"majorChannel"`
+	MinorChannel string `json:"minorChannel"`
+	CallSign     string `json:"callSign"`
+	Description  string `json:"description"`
+	Logo         string `json:"logo"`
+	ChannelIndex int    `json:"channelIndex"`
+}
+
+type TitanTVLineupResponse struct {
+	Channels []TitanTVChannel `json:"channels"`
+}
+
+type TitanTVEvent struct {
+	StartTime   string  `json:"startTime"` // ISO 8601
+	EndTime     string  `json:"endTime"`   // ISO 8601
+	Title       string  `json:"title"`
+	SubTitle    string  `json:"subtitle"`
+	Description string  `json:"description"`
+	ImageURL    string  `json:"imageUrl"`
+	SeasonNum   int     `json:"seasonNum"`
+	EpisodeNum  int     `json:"episodeNum"`
+	Year        int     `json:"year"`
+	OriginalAir string  `json:"originalAirDate"`
+	Rating      string  `json:"rating"`
+	StarRating  float64 `json:"starRating"`
+	Genres      string  `json:"genres"`
+	ProgramType string  `json:"programType"`
+	IsNew       bool    `json:"isNew"`
+	NewRepeat   string  `json:"newRepeat"`
+}
+
+type TitanTVDay struct {
+	Date   string         `json:"date"`
+	Events []TitanTVEvent `json:"events"`
+}
+
+type TitanTVChannelSchedule struct {
+	ChannelIndex int          `json:"channelIndex"`
+	Days         []TitanTVDay `json:"days"`
+}
+
+type TitanTVScheduleResponse struct {
+	Channels []TitanTVChannelSchedule `json:"channels"`
+}
+
 type Keyword struct {
 	ID        int       `json:"id"`
 	Name      string    `json:"name"`

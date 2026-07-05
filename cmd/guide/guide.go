@@ -8,80 +8,78 @@ import (
 	"net/http"
 	"os"
 	"sort"
-	"strings"
 	"time"
 
 	pkgcfg "github.com/prziborowski/hdhr-dvr/pkg/config"
 	"github.com/prziborowski/hdhr-dvr/pkg/types"
 )
 
-func fetchLocalChannels() ([]types.Channel, error) {
-	resp, err := http.Get("http://localhost:8080/api/channels")
+const titanTVBaseURL = "https://titantv.com/api"
+
+func fetchTitanTVChannels(userId, lineupId string) ([]types.TitanTVChannel, error) {
+	url := fmt.Sprintf("%s/channel/%s/%s", titanTVBaseURL, userId, lineupId)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close() //nolint: errcheck
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("server returned non-OK status: %d", resp.StatusCode)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	var channels []types.Channel
-	if err := json.Unmarshal(body, &channels); err != nil {
+	var response types.TitanTVLineupResponse
+	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, err
 	}
 
-	return channels, nil
+	return response.Channels, nil
 }
 
-func fetchLineupData(url string) ([]types.LineupData, error) {
-	resp, err := http.Get(url)
+func fetchTitanTVScheduleBlock(userId, lineupId string, startTime time.Time) (*types.TitanTVScheduleResponse, error) {
+	dateStr := startTime.Format("200601021504")
+	url := fmt.Sprintf("%s/schedule/%s/%s/%s/360", titanTVBaseURL, userId, lineupId, dateStr)
+
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close() //nolint: errcheck
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("server returned non-OK status: %d", resp.StatusCode)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	var data []types.LineupData
-	if err := json.Unmarshal(body, &data); err != nil {
+	var response types.TitanTVScheduleResponse
+	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, err
 	}
 
-	return data, nil
-}
-
-func fetchListingData(url string) ([][]types.ListingData, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close() //nolint: errcheck
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var data [][]types.ListingData
-	if err := json.Unmarshal(body, &data); err != nil {
-		// Try to get more context about the error
-		log.Printf("Raw response: %s", string(body[:min(100, len(body))]))
-		return nil, err
-	}
-
-	return data, nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	return &response, nil
 }
 
 func main() {
@@ -91,209 +89,117 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	log.Printf("Using configuration: timezone=%s, lineUpID=%s, days=%d",
-		config.Timezone, config.LineUpID, config.Days)
+	loc, err := time.LoadLocation(config.Timezone)
+	if err != nil {
+		log.Fatalf("Invalid timezone %s: %v", config.Timezone, err)
+	}
 
-	// Load existing guide data if it exists
-	var existingGuide types.Guide
-	existingData, err := os.ReadFile(config.GuideFile)
-	if err == nil {
-		if err := json.Unmarshal(existingData, &existingGuide); err != nil {
-			log.Printf("Error parsing existing guide: %v", err)
+	log.Printf("Fetching guide data from TitanTV for UserID: %s and LineupID: %s", config.UserID, config.LineUpID)
+
+	// 1. Fetch Channels
+	titanChannels, err := fetchTitanTVChannels(config.UserID, config.LineUpID)
+	if err != nil {
+		log.Fatalf("Error fetching TitanTV channels: %v", err)
+	}
+	log.Printf("Found %d channels", len(titanChannels))
+
+	// Map channelIndex -> TitanTVChannel for easy lookup and prepare output LineupData
+	channelMap := make(map[int]types.TitanTVChannel)
+	var filteredLineup []types.LineupData
+
+	for _, ch := range titanChannels {
+		channelMap[ch.ChannelIndex] = ch
+
+		channelNum := ch.MajorChannel
+		if ch.MinorChannel != "" {
+			channelNum += "." + ch.MinorChannel
 		}
-	} else if !os.IsNotExist(err) {
-		log.Printf("Error reading existing guide: %v", err)
+
+		filteredLineup = append(filteredLineup, types.LineupData{
+			StationID:       ch.ChannelID,
+			ChannelNumber:   channelNum,
+			StationCallSign: ch.CallSign,
+			Logo:            ch.Logo,
+		})
 	}
 
-	// Get local channels we can receive
-	var (
-		localChannels       []types.Channel
-		filteredLineup      []types.LineupData
-		useExistingChannels bool
-	)
+	// 2. Fetch Schedule in blocks (matching titantv_grabber.py logic)
+	var allPrograms []types.Program
+	startTime := time.Now().In(loc).Truncate(time.Hour)
 
-	// Check if we have existing channel data
-	if len(existingGuide.Channels) > 0 {
-		useExistingChannels = true
-		filteredLineup = existingGuide.Channels
-		log.Printf("Using existing channel data (%d channels)", len(filteredLineup))
-	}
+	log.Printf("Fetching schedule starting from %s", startTime.Format(time.RFC3339))
 
-	// Only fetch local channels if we don't have existing channel data
-	if !useExistingChannels {
-		log.Println("Fetching local channels...")
-		localChannels, err = fetchLocalChannels()
+	for i := 0; i < 28; i++ { // 7 days * 4 blocks of 6 hours per day = 28 blocks
+		blockStartTime := startTime.Add(time.Duration(i*6) * time.Hour)
+		log.Printf("Fetching block %d/28 (starting %s)...", i+1, blockStartTime.Format("2006-01-02 15:04"))
+
+		schedResp, err := fetchTitanTVScheduleBlock(config.UserID, config.LineUpID, blockStartTime)
 		if err != nil {
-			log.Printf("Warning: Could not fetch local channels: %v", err)
-			log.Println("Will use all available channels from lineup")
-		} else {
-			// GET lineup data from tvtv.us
-			lineupURL := fmt.Sprintf("https://www.tvtv.us/api/v1/lineup/%s/channels", config.LineUpID)
-			lineupData, err := fetchLineupData(lineupURL)
-			if err != nil {
-				log.Fatalf("Error fetching lineup data: %v", err)
-			}
-
-			// Filter lineup to only include channels we can receive
-			for _, channel := range lineupData {
-				for _, local := range localChannels {
-					if channel.ChannelNumber == local.GuideNumber {
-						filteredLineup = append(filteredLineup, channel)
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// If we still don't have any channels, get all available channels
-	if len(filteredLineup) == 0 {
-		log.Println("No channel filtering applied, using all available channels")
-		lineupURL := fmt.Sprintf("https://www.tvtv.us/api/v1/lineup/%s/channels", config.LineUpID)
-		lineupData, err := fetchLineupData(lineupURL)
-		if err != nil {
-			log.Fatalf("Error fetching lineup data: %v", err)
-		}
-		filteredLineup = lineupData
-	}
-
-	// Process channels
-	allChannels := make([]string, 0, len(filteredLineup))
-	for _, channel := range filteredLineup {
-		allChannels = append(allChannels, channel.StationID)
-	}
-
-	var newPrograms []types.Program
-
-	// Process each day
-	for day := 0; day < config.Days; day++ {
-		dayKey := time.Now().Add(time.Duration(day) * 24 * time.Hour).Format("2006-01-02")
-
-		// Calculate day boundaries in local time
-		loc, err := time.LoadLocation(config.Timezone)
-		if err != nil {
-			log.Printf("Error loading timezone: %v", err)
+			log.Printf("Error fetching schedule block %d: %v", i+1, err)
 			continue
 		}
 
-		// Calculate midnight in local time
-		now := time.Now().In(loc)
-		midnightLocal := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-		midnightLocal = midnightLocal.Add(time.Duration(day) * 24 * time.Hour)
-
-		// Convert to UTC
-		midnightUTC := midnightLocal.UTC()
-		endOfDayLocal := midnightLocal.Add(24*time.Hour - time.Second)
-		endOfDayUTC := endOfDayLocal.UTC()
-
-		// Format as ISO 8601 with milliseconds
-		startTime := midnightUTC.Format("2006-01-02T15:04:05.000Z")
-		endTime := endOfDayUTC.Format("2006-01-02T15:04:05.000Z")
-
-		log.Printf("Fetching data for day %s (Local: %s to %s, UTC: %s to %s)",
-			dayKey,
-			midnightLocal.Format("2006-01-02T15:04:05-07:00"),
-			endOfDayLocal.Format("2006-01-02T15:04:05-07:00"),
-			startTime,
-			endTime)
-
-		// Load listing data in batches of 20 channels max
-		var listingData [][]types.ListingData
-		for i := 0; i < len(allChannels); i += 20 {
-			end := i + 20
-			if end > len(allChannels) {
-				end = len(allChannels)
-			}
-			channels := allChannels[i:end]
-			listingURL := fmt.Sprintf("https://www.tvtv.us/api/v1/lineup/%s/grid/%s/%s/%s",
-				config.LineUpID, startTime, endTime, strings.Join(channels, ","))
-			batchData, err := fetchListingData(listingURL)
-			if err != nil {
-				log.Printf("Error fetching listing data for day %d: %v", day, err)
+		for _, chSched := range schedResp.Channels {
+			chInfo, ok := channelMap[chSched.ChannelIndex]
+			if !ok {
+				log.Printf("Warning: No channel info found for index %d", chSched.ChannelIndex)
 				continue
 			}
-			listingData = append(listingData, batchData...)
-		}
 
-		// Process programs - now properly correlated with channels
-		for channelIndex, channel := range filteredLineup {
-			// Get the listings for this specific channel
-			if channelIndex < len(listingData) {
-				programList := listingData[channelIndex]
-				for _, program := range programList {
-					// Convert times to local timezone
-					programStartTime := strings.ReplaceAll(program.StartTime, "Z", "")
-					startTime, err := time.Parse("2006-01-02T15:04", programStartTime)
+			channelNum := chInfo.MajorChannel
+			if chInfo.MinorChannel != "" {
+				channelNum += "." + chInfo.MinorChannel
+			}
+
+			for _, day := range chSched.Days {
+				for _, evt := range day.Events {
+					// Parse TitanTV ISO 8601 time: "2026-01-29T10:00:00"
+					start, err := time.Parse("2006-01-02T15:04:05", evt.StartTime)
 					if err != nil {
-						log.Printf("Error parsing time: %v", err)
-						continue
-					}
-					startTime = startTime.In(loc)
-					endTime := startTime.Add(time.Duration(program.RunTime) * time.Minute)
-
-					// Create program entry
-					prog := types.Program{
-						Channel:  channel.ChannelNumber,
-						Title:    program.Title,
-						SubTitle: program.Subtitle,
-						Start:    startTime.Format("2006-01-02T15:04:05-07:00"),
-						End:      endTime.Format("2006-01-02T15:04:05-07:00"),
-						Duration: program.RunTime,
-					}
-
-					// Set category based on type
-					switch program.Type {
-					case "M":
-						prog.Category = "movie"
-					case "N":
-						prog.Category = "news"
-					case "S":
-						prog.Category = "sports"
-					}
-
-					// Check flags
-					for _, flag := range program.Flags {
-						switch flag {
-						case "EI":
-							prog.Category = "kids"
-						case "HD":
-							prog.Video.Quality = "HDTV"
-						case "Stereo":
-							prog.Audio.Stereo = "stereo"
-						case "New":
-							prog.New = true
+						start, err = time.Parse("2006-01-02T15:04", evt.StartTime)
+						if err != nil {
+							log.Printf("Error parsing start time %s: %v", evt.StartTime, err)
+							continue
 						}
 					}
 
-					newPrograms = append(newPrograms, prog)
+					end, err := time.Parse("2006-01-02T15:04:05", evt.EndTime)
+					if err != nil {
+						end, err = time.Parse("2006-01-02T15:04", evt.EndTime)
+						if err != nil {
+							log.Printf("Error parsing end time %s: %v", evt.EndTime, err)
+							continue
+						}
+					}
+
+					// Map to types.Program
+					prog := types.Program{
+						Channel:  channelNum,
+						Title:    evt.Title,
+						SubTitle: evt.SubTitle,
+						Start:    start.In(loc).Format("2006-01-02T15:04:05-07:00"),
+						End:      end.In(loc).Format("2006-01-02T15:04:05-07:00"),
+						Duration: int(end.Sub(start).Minutes()),
+					}
+
+					if evt.ProgramType == "M" {
+						prog.Category = "movie"
+					} else if evt.ProgramType == "S" {
+						prog.Category = "sports"
+					} else if evt.ProgramType == "N" {
+						prog.Category = "news"
+					}
+
+					if evt.IsNew {
+						prog.New = true
+					}
+
+					allPrograms = append(allPrograms, prog)
 				}
 			}
 		}
-
-		log.Printf("Processed day: %s", dayKey)
 	}
 
-	// Use a map to handle deduplication and updates (Prefer new data over existing)
-	progMap := make(map[string]types.Program)
-
-	// Add existing programs first
-	for _, p := range existingGuide.Programs {
-		key := fmt.Sprintf("%s-%s", p.Start, p.Channel)
-		progMap[key] = p
-	}
-
-	// Overwrite with new programs (this updates titles/subtitles if they changed)
-	for _, p := range newPrograms {
-		key := fmt.Sprintf("%s-%s", p.Start, p.Channel)
-		progMap[key] = p
-	}
-
-	var allPrograms []types.Program
-	for _, p := range progMap {
-		allPrograms = append(allPrograms, p)
-	}
-
-	// Sort programs by start time and channel
 	sort.SliceStable(allPrograms, func(i, j int) bool {
 		if allPrograms[i].Start == allPrograms[j].Start {
 			return allPrograms[i].Channel < allPrograms[j].Channel
@@ -301,32 +207,12 @@ func main() {
 		return allPrograms[i].Start < allPrograms[j].Start
 	})
 
-	// Remove programs that have already ended
-	currentTime := time.Now()
-	var filteredPrograms []types.Program
-	for _, prog := range allPrograms {
-		// Parse the start time
-		startTime, err := time.Parse("2006-01-02T15:04:05-07:00", prog.Start)
-		if err != nil {
-			log.Printf("Error parsing start time: %v", err)
-			continue
-		}
-		// Calculate end time (start time + duration)
-		endTime := startTime.Add(time.Duration(prog.Duration) * time.Minute)
-		// Only keep programs that haven't ended yet
-		if endTime.After(currentTime) {
-			filteredPrograms = append(filteredPrograms, prog)
-		}
-	}
-
-	// Create output structure with unique programs
 	output := types.Guide{
 		Channels:  filteredLineup,
-		Programs:  filteredPrograms,
+		Programs:  allPrograms,
 		Generated: time.Now().Format(time.RFC3339),
 	}
 
-	// Output JSON to file
 	outputData, err := json.MarshalIndent(output, "", "  ")
 	if err != nil {
 		log.Fatalf("Error encoding JSON: %v", err)
