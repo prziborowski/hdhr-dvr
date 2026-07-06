@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -67,7 +66,7 @@ func main() {
 	log.Printf("Found %d existing pending recordings", len(pendingRecordings))
 
 	// Load guide data
-	guideData, err := loadGuideData(config.GuideFile)
+	guideData, err := loadGuideData(apiBaseURL)
 	if err != nil {
 		log.Fatalf("Failed to load guide data: %v", err)
 	}
@@ -221,15 +220,20 @@ func fetchPendingRecordings(baseURL string) ([]types.Recording, error) {
 	return pending, nil
 }
 
-func loadGuideData(guideFile string) (*types.Guide, error) {
-	data, err := os.ReadFile(guideFile)
+func loadGuideData(apiBaseURL string) (*types.Guide, error) {
+	resp, err := http.Get(apiBaseURL + "/api/guide")
 	if err != nil {
-		return nil, fmt.Errorf("reading guide file: %w", err)
+		return nil, fmt.Errorf("fetching guide data: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	var guide types.Guide
-	if err := json.Unmarshal(data, &guide); err != nil {
-		return nil, fmt.Errorf("parsing guide file: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(&guide); err != nil {
+		return nil, fmt.Errorf("decoding guide data: %w", err)
 	}
 
 	return &guide, nil

@@ -89,8 +89,9 @@ func main() {
 	loadChannels()
 
 	// Load guide data
-	loadGuide()
-	go setupFileWatcher(config.GuideFile)
+	if loadGuide() {
+		go setupFileWatcher(config.GuideFile)
+	}
 
 	// Load existing recordings
 	loadRecordings()
@@ -189,7 +190,8 @@ func createTables() {
         CREATE TABLE IF NOT EXISTS channels (
             guide_number TEXT PRIMARY KEY,
             guide_name TEXT,
-            url TEXT
+            url TEXT,
+            enabled INTEGER DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS recordings (
@@ -234,15 +236,31 @@ func loadChannels() {
 	}
 
 	// Store channels in database
-	tx, _ := db.Begin()
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("Error starting transaction for channels: %v", err)
+		return
+	}
+
+	// Clear current channels to ensure we only have the latest list
+	_, err = tx.Exec("UPDATE channels SET enabled=0")
+	if err != nil {
+		log.Printf("Error clearing channels table: %v", err)
+		tx.Rollback() //nolint: errcheck
+		return
+	}
+
 	for _, ch := range chs {
-		_, err := tx.Exec("INSERT OR IGNORE INTO channels (guide_number, guide_name, url) VALUES (?, ?, ?)",
-			ch.GuideNumber, ch.GuideName, ch.URL)
+		_, err := tx.Exec("INSERT OR REPLACE INTO channels (guide_number, guide_name, url, enabled) VALUES (?, ?, ?, ?)",
+			ch.GuideNumber, ch.GuideName, ch.URL, ch.Enabled == nil || *ch.Enabled == 1)
 		if err != nil {
-			log.Printf("Error storing channel: %v", err)
+			log.Printf("Error storing channel %s: %v", ch.GuideNumber, err)
 		}
 	}
-	tx.Commit() //nolint: errcheck
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("Error committing channels transaction: %v", err)
+	}
 }
 
 func loadRecordings() {
@@ -722,7 +740,7 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 // getChannels returns the list of available channels
 func getChannels(w http.ResponseWriter, r *http.Request) {
 	// Get channels from database
-	rows, err := db.Query("SELECT guide_number, guide_name FROM channels")
+	rows, err := db.Query("SELECT guide_number, guide_name FROM channels WHERE enabled=1")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1202,24 +1220,26 @@ func getLocalLocation() (*time.Location, error) {
 }
 
 // Load the guide data from file
-func loadGuide() {
+func loadGuide() bool {
 	if _, err := os.Stat(config.GuideFile); os.IsNotExist(err) {
 		log.Println("No guide.json found, skipping")
-		return
+		return false
 	}
 
 	file, err := os.Open(config.GuideFile)
 	if err != nil {
 		log.Printf("Error opening guide.json: %v", err)
-		return
+		return false
 	}
 	defer file.Close() //nolint: errcheck
 
 	if err := json.NewDecoder(file).Decode(&guideData); err != nil {
 		log.Printf("Error decoding guide.json: %v", err)
+		return false
 	} else {
 		log.Println("Loaded guide data")
 	}
+	return true
 }
 
 func setupFileWatcher(filePath string) {
@@ -1241,7 +1261,7 @@ func setupFileWatcher(filePath string) {
 				}
 				if event.Op&fsnotify.Write == fsnotify.Write {
 					log.Println("Modified file detected:", event.Name)
-					loadGuide()
+					_ = loadGuide()
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -1254,7 +1274,8 @@ func setupFileWatcher(filePath string) {
 
 	err = watcher.Add(filePath)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error adding watcher for %s: %v", filePath, err)
+		return
 	}
 	<-done
 }
@@ -1268,6 +1289,25 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 	guideDataMutex.RLock()
 	defer guideDataMutex.RUnlock()
 
+	// Get current local channels from database to filter guide
+	rows, err := db.Query("SELECT guide_number FROM channels WHERE enabled=1")
+	if err != nil {
+		log.Printf("Error fetching valid channels: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	channelMap := make(map[string]bool)
+	for rows.Next() {
+		var chNum string
+		if err := rows.Scan(&chNum); err != nil {
+			log.Printf("Error scanning channel number: %v", err)
+			continue
+		}
+		channelMap[chNum] = true
+	}
+
 	// Check if programs exist in guide data
 	if programs, ok := guideData["programs"].([]interface{}); ok {
 		var filteredPrograms []map[string]interface{}
@@ -1276,6 +1316,12 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 		for _, progInterface := range programs {
 			progMap, ok := progInterface.(map[string]interface{})
 			if !ok {
+				continue
+			}
+
+			// Filter out programs not in the local channel list
+			channelNum, ok := progMap["channel"].(string)
+			if !ok || !channelMap[channelNum] {
 				continue
 			}
 

@@ -17,6 +17,7 @@ type Channel struct {
 	SignalStrength int    `json:"SignalStrength"`
 	SignalQuality  int    `json:"SignalQuality"`
 	URL            string `json:"URL"`
+	Enabled        *int   `json:"Enabled"`
 }
 
 type Program struct {
@@ -121,9 +122,9 @@ type ListingData struct {
 // TitanTV API Response Types
 
 type TitanTVChannel struct {
-	ChannelID    string `json:"channelId"`
-	MajorChannel string `json:"majorChannel"`
-	MinorChannel string `json:"minorChannel"`
+	ChannelID    int    `json:"channelId"`
+	MajorChannel int    `json:"majorChannel"`
+	MinorChannel int    `json:"minorChannel"`
 	CallSign     string `json:"callSign"`
 	Description  string `json:"description"`
 	Logo         string `json:"logo"`
@@ -138,7 +139,7 @@ type TitanTVEvent struct {
 	StartTime   string  `json:"startTime"` // ISO 8601
 	EndTime     string  `json:"endTime"`   // ISO 8601
 	Title       string  `json:"title"`
-	SubTitle    string  `json:"subtitle"`
+	SubTitle    string  `json:"episodeTitle"`
 	Description string  `json:"description"`
 	ImageURL    string  `json:"imageUrl"`
 	SeasonNum   int     `json:"seasonNum"`
