@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -55,7 +56,7 @@ func (r *Recording) GetFilePath() string {
 	} else {
 		titleStr = r.ChannelID
 	}
-	outputFile := fmt.Sprintf("%s-%s-%s.mp4", r.Date, r.StartTime, titleStr)
+	outputFile := fmt.Sprintf("%s-%s-%s.ts", r.Date, r.StartTime, titleStr)
 
 	return outputFile
 }
@@ -68,11 +69,15 @@ func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir strin
 		return "failed"
 	}
 
-	filePath := filepath.Join(storageDir, r.GetFilePath())
+	filePathTS := filepath.Join(storageDir, r.GetFilePath())
+	filePathMP4 := strings.TrimSuffix(filePathTS, filepath.Ext(filePathTS)) + ".mp4"
 
-	// Check if file exists and is valid
-	if _, err := os.Stat(filePath); err == nil {
-		return "completed"
+	// Check if either TS or MP4 file exists
+	fileExists := false
+	if _, err := os.Stat(filePathTS); err == nil {
+		fileExists = true
+	} else if _, err := os.Stat(filePathMP4); err == nil {
+		fileExists = true
 	}
 
 	// Calculate end time (with pre-roll)
@@ -85,13 +90,21 @@ func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir strin
 	endTime := startTime.Add(time.Duration(r.Duration+1) * time.Minute) // +1 for pre-roll
 	now := time.Now().In(loc)
 
-	if now.Before(startTime) {
-		return "pending"
-	} else if now.Before(endTime) {
+	if !fileExists {
+		if now.Before(startTime) {
+			return "pending"
+		} else if now.Before(endTime) {
+			return "recording"
+		}
+		return "failed"
+	}
+
+	// File exists: check if we are still within the recording window
+	if now.Before(endTime) {
 		return "recording"
 	}
 
-	return "failed"
+	return "completed"
 }
 
 type Guide struct {

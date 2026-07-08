@@ -690,8 +690,36 @@ func startRecording(r types.Recording) {
 
 	// Remove from running processes
 	runningProcesses.Delete(r.ID)
+
+	// Perform fast conversion from TS to MP4
+	mp4File := strings.TrimSuffix(outputFile, filepath.Ext(outputFile)) + ".mp4"
+	if err := convertToMp4(outputFile, mp4File); err != nil {
+		log.Printf("Conversion warning: %v", err)
+		// We don't mark as failed because the TS file still exists and is playable
+	} else {
+		// Optional: remove original TS file after successful conversion
+		_ = os.Remove(outputFile)
+	}
+
 	// Final log message
-	log.Printf("Recording completed successfully: %s", outputFile)
+	log.Printf("Recording completed successfully and converted to MP4: %s", mp4File)
+}
+
+// convertToMp4 performs a fast re-mux from TS to MP4 without re-encoding
+func convertToMp4(tsFile, mp4File string) error {
+	log.Printf("Converting %s to %s...", tsFile, mp4File)
+	args := []string{
+		"-i", tsFile,
+		"-c", "copy", // Copy streams without re-encoding
+		"-movflags", "+faststart", // Enable fast start for web streaming
+		"-y", // Overwrite output file if it exists
+		mp4File,
+	}
+	cmd := exec.Command("ffmpeg", args...)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg conversion failed: %w", err)
+	}
+	return nil
 }
 
 // buildFFmpegArgs builds the ffmpeg command arguments
@@ -713,13 +741,12 @@ func buildFFmpegArgs(inputURL string, durationSeconds int, outputFile string) []
 		"-reconnect", "1", // Enable reconnection
 		"-reconnect_at_eof", "1", // Reconnect when stream ends
 		"-reconnect_streamed", "1", // Reconnect for streamed content
-		"-reconnect_delay_max", "60", // Maximum reconnection delay in seconds
+		"-reconnect_delay_max", "600", // Maximum reconnection delay in seconds
 
 		// Output options
 		"-t", fmt.Sprintf("%d", durationSeconds),
 		"-c", "copy", // Stream copy mode
-		"-f", "mp4", // Force MP4 format
-		"-movflags", "+faststart", // Enable fast start for web streaming
+		"-f", "mpegts", // Force MPEG-TS format for reliability
 		outputFile,
 	}
 	return args
