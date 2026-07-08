@@ -110,10 +110,28 @@ func main() {
 		log.Printf("Found keyword match: '%s' in program '%s' (category: %s)",
 			matchedKeyword, program.Title, program.Category)
 
+		title := program.Title
+		if program.SubTitle != "" {
+			title = fmt.Sprintf("%s - %s", title, program.SubTitle)
+		}
+
 		// Check if we already have a pending recording for this channel and time
-		if isDuplicate(pendingRecordings, program, loc) {
-			log.Printf("Skipping duplicate: Already scheduled for channel %s at %s",
-				program.Channel, program.Start)
+		if rec := findPendingRecording(pendingRecordings, program, loc); rec != nil {
+			log.Printf("Found existing recording for channel %s at %s", program.Channel, program.Start)
+
+			existingTitle := ""
+			if rec.Title != nil {
+				existingTitle = *rec.Title
+			}
+
+			if title != existingTitle {
+				log.Printf("Updating title from '%s' to '%s'", existingTitle, title)
+				if err := updateRecordingTitle(apiBaseURL, rec.ID, title); err != nil {
+					log.Printf("Error updating recording title: %v", err)
+				}
+			} else {
+				log.Printf("Skipping duplicate: Already scheduled with same title")
+			}
 			continue
 		}
 
@@ -129,11 +147,6 @@ func main() {
 
 		dateStr := startTime.Format("2006-01-02")
 		timeStr := startTime.Format("15:04")
-
-		title := program.Title
-		if program.SubTitle != "" {
-			title = fmt.Sprintf("%s - %s", title, program.SubTitle)
-		}
 
 		// Schedule the recording via API
 		apiURL := apiBaseURL + "/api/recordings"
@@ -267,33 +280,6 @@ func findMatchingKeyword(program types.Program, keywords []types.Keyword) string
 	return ""
 }
 
-func isDuplicate(pendingRecordings []types.Recording, program types.Program, loc *time.Location) bool {
-	// Parse program start time and convert to UTC for comparison
-	startTimeUTC, err := parseProgramStartTime(program, time.UTC)
-	if err != nil {
-		return false
-	}
-
-	for _, rec := range pendingRecordings {
-		// Parse recording start time using the local timezone, then convert to UTC
-		recTimeLocal, err := time.ParseInLocation("2006-01-02 15:04", fmt.Sprintf("%s %s", rec.Date, rec.StartTime), loc)
-		if err != nil {
-			continue
-		}
-		recTimeUTC := recTimeLocal.UTC()
-
-		// Check if same channel and within 30 minutes of each other
-		if strings.EqualFold(rec.ChannelID, program.Channel) {
-			diff := startTimeUTC.Sub(recTimeUTC).Minutes()
-			if diff >= -30 && diff <= 30 {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
 func calculateDuration(program types.Program) int {
 	duration := program.Duration
 
@@ -354,6 +340,56 @@ func scheduleRecording(apiURL string, req RecordingRequest) error {
 		if err := json.NewDecoder(resp.Body).Decode(&errMsg); err == nil {
 			return fmt.Errorf("API error (%d): %s", resp.StatusCode, errMsg["error"])
 		}
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+func findPendingRecording(pendingRecordings []types.Recording, program types.Program, loc *time.Location) *types.Recording {
+	startTimeUTC, err := parseProgramStartTime(program, time.UTC)
+	if err != nil {
+		return nil
+	}
+
+	for _, rec := range pendingRecordings {
+		recTimeLocal, err := time.ParseInLocation("2006-01-02 15:04", fmt.Sprintf("%s %s", rec.Date, rec.StartTime), loc)
+		if err != nil {
+			continue
+		}
+		recTimeUTC := recTimeLocal.UTC()
+
+		if strings.EqualFold(rec.ChannelID, program.Channel) {
+			diff := startTimeUTC.Sub(recTimeUTC).Minutes()
+			if diff >= -30 && diff <= 30 {
+				return &rec
+			}
+		}
+	}
+	return nil
+}
+
+func updateRecordingTitle(apiURL string, id int, title string) error {
+	reqBody := map[string]string{"title": title}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("marshaling request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	url := fmt.Sprintf("%s/api/recordings/%d", apiURL, id)
+	req, err := http.NewRequest("PATCH", url, bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("sending request to %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 

@@ -126,6 +126,7 @@ func main() {
 	r.HandleFunc("/api/recordings", getRecordings).Methods("GET")
 	r.HandleFunc("/api/recordings", createRecording).Methods("POST")
 	r.HandleFunc("/api/recordings/{id}", deleteRecording).Methods("DELETE")
+	r.HandleFunc("/api/recordings/{id}", updateRecording).Methods("PATCH")
 	r.HandleFunc("/api/recordings/{id}/file", getRecordingFile).Methods("GET", "HEAD")
 	r.HandleFunc("/api/guide", getGuide).Methods("GET")
 	// Auto-record keywords routes
@@ -183,6 +184,44 @@ func main() {
 	}()
 
 	log.Fatal(server.ListenAndServe())
+}
+
+func updateRecording(w http.ResponseWriter, r *http.Request) {
+	idStr := mux.Vars(r)["id"]
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "Invalid recording ID", http.StatusBadRequest)
+		return
+	}
+
+	var updateReq struct {
+		Title *string `json:"title"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&updateReq); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if updateReq.Title == nil {
+		http.Error(w, "Title is required", http.StatusBadRequest)
+		return
+	}
+
+	result, err := db.Exec("UPDATE recordings SET title = ? WHERE id = ? AND status = 'pending'", *updateReq.Title, id)
+	if err != nil {
+		log.Printf("Error updating recording: %v", err)
+		http.Error(w, "Failed to update recording", http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		http.Error(w, "Recording not found or not pending", http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func createTables() {
