@@ -339,10 +339,14 @@
                 return;
             }
 
-            // Calculate data usage for this recording
-            const durationInMinutes = recording.duration;
-            const dataUsage = (durationInMinutes / 60) * HOUR_USAGE;
-            totalMB += dataUsage;
+            // Use actual file size if available, otherwise estimate based on duration
+            if (recording.file_size && recording.file_size > 0) {
+                totalMB += recording.file_size / (1024 * 1024); // Convert bytes to MB
+            } else {
+                const durationInMinutes = recording.duration;
+                const dataUsage = (durationInMinutes / 60) * HOUR_USAGE;
+                totalMB += dataUsage;
+            }
         });
 
         // Convert to GB for display

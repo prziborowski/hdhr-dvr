@@ -47,6 +47,7 @@ type Recording struct {
 	Status    string
 	Title     *string `json:"title,omitempty"`
 	CreatedAt time.Time
+	FileSize  int
 }
 
 func (r *Recording) GetFilePath() string {

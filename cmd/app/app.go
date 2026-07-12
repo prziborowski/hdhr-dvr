@@ -242,6 +242,7 @@ func createTables() {
             duration INTEGER,
             status TEXT DEFAULT 'pending',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            file_size INTEGER DEFAULT 0,
             FOREIGN KEY(channel_id) REFERENCES channels(guide_number)
         );
         CREATE INDEX IF NOT EXISTS idx_recordings_channel ON recordings(channel_id);
@@ -312,7 +313,7 @@ func loadRecordings() {
 	}
 	// Get all recordings from database
 	rows, err := tx.Query(`
-        SELECT id, channel_id, date, start_time, duration, status, title
+        SELECT id, channel_id, date, start_time, duration, status, title, file_size
         FROM recordings
     `)
 	if err != nil {
@@ -328,7 +329,7 @@ func loadRecordings() {
 	// Process each recording
 	for rows.Next() {
 		var r types.Recording
-		if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status, &r.Title); err != nil {
+		if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status, &r.Title, &r.FileSize); err != nil {
 			log.Printf("Error scanning recording: %v", err)
 			continue
 		}
@@ -738,6 +739,17 @@ func startRecording(r types.Recording) {
 	} else {
 		// Optional: remove original TS file after successful conversion
 		_ = os.Remove(outputFile)
+
+		// Get final file size and update database
+		if info, err := os.Stat(mp4File); err == nil {
+			size := info.Size()
+			_, err := db.Exec("UPDATE recordings SET file_size = ? WHERE id = ?", size, r.ID)
+			if err != nil {
+				log.Printf("Error updating recording file size: %v", err)
+			}
+		} else {
+			log.Printf("Error getting final recording file size: %v", err)
+		}
 	}
 
 	// Final log message
@@ -756,7 +768,22 @@ func convertToMp4(tsFile, mp4File string) error {
 	}
 	cmd := exec.Command("ffmpeg", args...)
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("ffmpeg conversion failed: %w", err)
+		log.Printf("ffmpeg conversion failed: %w, attempting slower conversion", err)
+
+		args = []string{
+			"-err_detect", "ignore_err",
+			"-fflags", "+genpts+discardcorrupt",
+			"-i", tsFile,
+			"-c", "copy", // Copy streams without re-encoding
+			"-map", "0",
+			"-f", "matroska",
+			"-y", // Overwrite output file if it exists
+			mp4File,
+		}
+		cmd = exec.Command("ffmpeg", args...)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("ffmpeg conversion failed: %w", err)
+		}
 	}
 	return nil
 }
@@ -834,10 +861,23 @@ func getChannels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(channelList) //nolint: errcheck
 }
 
+type GetRecordingsRec struct {
+	ID          int     `json:"id"`
+	ChannelID   string  `json:"channel_id"`
+	Date        string  `json:"date"`
+	StartTime   string  `json:"start_time"`
+	Duration    int     `json:"duration"`
+	Status      string  `json:"status"`
+	Title       *string `json:"title,omitempty"`
+	FileSize    int     `json:"file_size"`
+	GuideNumber string  `json:"guide_number"`
+	GuideName   string  `json:"guide_name"`
+}
+
 func getRecordings(w http.ResponseWriter, r *http.Request) {
 	// Get recordings with channel information
 	rows, err := db.Query(`
-        SELECT r.id, r.channel_id, r.date, r.start_time, r.duration, r.status, r.title,
+        SELECT r.id, r.channel_id, r.date, r.start_time, r.duration, r.status, r.title, r.file_size,
                c.guide_number, c.guide_name
         FROM recordings r
         LEFT JOIN channels c ON r.channel_id = c.guide_number
@@ -849,32 +889,12 @@ func getRecordings(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close() //nolint: errcheck
 
-	var recordings []struct {
-		ID          int     `json:"id"`
-		ChannelID   string  `json:"channel_id"`
-		Date        string  `json:"date"`
-		StartTime   string  `json:"start_time"`
-		Duration    int     `json:"duration"`
-		Status      string  `json:"status"`
-		Title       *string `json:"title,omitempty"`
-		GuideNumber string  `json:"guide_number"`
-		GuideName   string  `json:"guide_name"`
-	}
+	var recordings []GetRecordingsRec
 
 	for rows.Next() {
-		var r struct {
-			ID          int     `json:"id"`
-			ChannelID   string  `json:"channel_id"`
-			Date        string  `json:"date"`
-			StartTime   string  `json:"start_time"`
-			Duration    int     `json:"duration"`
-			Status      string  `json:"status"`
-			Title       *string `json:"title,omitempty"`
-			GuideNumber string  `json:"guide_number"`
-			GuideName   string  `json:"guide_name"`
-		}
+		var r GetRecordingsRec
 		if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status,
-			&r.Title, &r.GuideNumber, &r.GuideName); err != nil {
+			&r.Title, &r.FileSize, &r.GuideNumber, &r.GuideName); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
