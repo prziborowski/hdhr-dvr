@@ -510,7 +510,7 @@
         let duration = program.duration;
         if (program.category && program.category.toLowerCase() === 'sports') {
             const titleLower = (program.title + ' ' + (program.subtitle || '')).toLowerCase();
-            if (titleLower.includes('basketball') || titleLower.includes('football') || titleLower.includes('fifa')) {
+            if (titleLower.includes('basketball') || titleLower.includes('football')) {
                 duration += 15; // Add 15 minutes
             }
         }

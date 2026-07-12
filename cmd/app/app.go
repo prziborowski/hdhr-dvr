@@ -1105,6 +1105,83 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check for duplicate recording (channel + date + start time)
+	var duplicateExists bool
+	err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM recordings WHERE channel_id = ? AND date = ? AND start_time = ?)", req.ChannelID, req.Date, req.StartTime).Scan(&duplicateExists)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if duplicateExists {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{ //nolint: errcheck
+			"error": "Recording already exists for this channel and time",
+		})
+		return
+	}
+
+	// Check tuner availability (max 4 concurrent recordings)
+	startStr := req.Date + " " + req.StartTime
+	reqStart, err := time.Parse("2006-01-02 15:04", startStr)
+	if err != nil {
+		http.Error(w, "Invalid date/time format", http.StatusBadRequest)
+		return
+	}
+	reqEnd := reqStart.Add(time.Duration(req.Duration) * time.Minute)
+
+	// Query recordings that overlap with the requested interval
+	rows, err := db.Query(`
+		SELECT date, start_time, duration
+		FROM recordings
+		WHERE datetime(date || ' ' || start_time) < datetime(?, '+' || ? || ' minutes')
+		  AND datetime(date || ' ' || start_time, '+' || duration || ' minutes') > datetime(?)`,
+		startStr, req.Duration, startStr)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type event struct {
+		t    time.Time
+		diff int
+	}
+	var events []event
+	for rows.Next() {
+		var d, s string
+		var dur int
+		if err := rows.Scan(&d, &s, &dur); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		st, _ := time.Parse("2006-01-02 15:04", d+" "+s)
+		et := st.Add(time.Duration(dur) * time.Minute)
+		events = append(events, event{st, 1})
+		events = append(events, event{et, -1})
+	}
+
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].t.Equal(events[j].t) {
+			return events[i].diff < events[j].diff // End before Start at same time
+		}
+		return events[i].t.Before(events[j].t)
+	})
+
+	currentTuners := 0
+	for _, e := range events {
+		currentTuners += e.diff
+		// Check if the current count exceeds capacity within the requested window
+		if (e.t.After(reqStart) || e.t.Equal(reqStart)) && (e.t.Before(reqEnd) || e.t.Equal(reqEnd)) {
+			if currentTuners >= 4 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{"error": "No tuners available during this time period"})
+				return
+			}
+		}
+	}
+
 	// Use a transaction for the database operations
 	tx, err := db.Begin()
 	if err != nil {
