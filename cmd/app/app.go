@@ -1574,20 +1574,25 @@ func cleanupOldRecordings() {
 		loc = time.UTC
 	}
 
-	// Get all pending recordings
 	rows, err := db.Query(`
         SELECT id, date, start_time, duration
         FROM recordings
-        WHERE status = 'pending'
+        WHERE status IN ('pending', 'recording')
     `)
 	if err != nil {
 		log.Printf("Error loading recordings for cleanup: %v", err)
 		return
 	}
-	defer rows.Close() //nolint: errcheck
 
-	now := time.Now().In(loc)
-	updatedCount := 0
+	// Collect all pending or stuck recording IDs and computed end times first.
+	// We must close the SELECT cursor (releasing the SQLite read lock)
+	// before doing any UPDATEs, otherwise SQLite will return "database is locked"
+	// because a pending read cursor blocks writes.
+	type recordingInfo struct {
+		id      int
+		endTime time.Time
+	}
+	var toUpdate []recordingInfo
 
 	for rows.Next() {
 		var id int
@@ -1598,7 +1603,6 @@ func cleanupOldRecordings() {
 			continue
 		}
 
-		// Parse the start time
 		dateTimeStr := fmt.Sprintf("%s %s", date, startTime)
 		startTimeParsed, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
 		if err != nil {
@@ -1606,17 +1610,23 @@ func cleanupOldRecordings() {
 			continue
 		}
 
-		// Calculate end time (with pre-roll and post-roll)
 		adjustedStartTime := startTimeParsed.Add(-30 * time.Second)
 		endTime := adjustedStartTime.Add(time.Duration(duration+1) * time.Minute)
 
-		// If recording has passed, mark as failed
-		if now.After(endTime) {
-			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", id)
+		toUpdate = append(toUpdate, recordingInfo{id, endTime})
+	}
+	rows.Close() // nolint: errcheck — close cursor before writing to avoid SQLite lock
+
+	now := time.Now().In(loc)
+	updatedCount := 0
+
+	for _, info := range toUpdate {
+		if now.After(info.endTime) {
+			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", info.id)
 			if err != nil {
-				log.Printf("Error updating recording %d status to failed: %v", id, err)
+				log.Printf("Error updating recording %d status to failed: %v", info.id, err)
 			} else {
-				log.Printf("Marked recording %d as failed (ended at %v)", id, endTime)
+				log.Printf("Marked recording %d as failed (ended at %v)", info.id, info.endTime)
 				updatedCount++
 			}
 		}
