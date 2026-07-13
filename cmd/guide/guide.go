@@ -24,7 +24,7 @@ func fetchTitanTVChannels(userId, lineupId string) ([]types.TitanTVChannel, erro
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -58,7 +58,7 @@ func fetchTitanTVScheduleBlock(userId, lineupId string, startTime time.Time) (*t
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -118,7 +118,8 @@ func main() {
 	// 1. Fetch Local Channels for filtering
 	localChannels, err := fetchLocalChannels()
 	if err != nil {
-		log.Printf("Warning: Could not fetch local channels from API: %v. Guide will be empty or unfiltered.", err)
+		log.Printf("Error fetching local channels from API: %v. Exiting because local channel list is required for filtering.", err)
+		log.Fatalf("Cannot generate guide without local channel list")
 	}
 	localChannelMap := make(map[string]bool)
 	for _, ch := range localChannels {

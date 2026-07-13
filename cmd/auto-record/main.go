@@ -179,44 +179,27 @@ func main() {
 }
 
 func fetchKeywords(baseURL string) ([]types.Keyword, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(baseURL + "/api/keywords")
-	if err != nil {
-		return nil, fmt.Errorf("requesting keywords: %w", err)
-	}
-	defer resp.Body.Close() //nolint: errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code fetching keywords: %d", resp.StatusCode)
-	}
-
-	var keywords []types.Keyword
-	if err := json.NewDecoder(resp.Body).Decode(&keywords); err != nil {
-		return nil, fmt.Errorf("decoding keywords: %w", err)
-	}
-
-	return keywords, nil
+	return fetchJSONWithRetry[types.Keyword](baseURL, "/api/keywords", 3)
 }
 
 func fetchPendingRecordings(baseURL string) ([]types.Recording, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(baseURL + "/api/recordings")
+	type pendingRecording struct {
+		ID        int     `json:"id"`
+		ChannelID string  `json:"channel_id"`
+		Date      string  `json:"date"`
+		StartTime string  `json:"start_time"`
+		Duration  int     `json:"duration"`
+		Status    string  `json:"status"`
+		Title     *string `json:"title,omitempty"`
+	}
+
+	raw, err := fetchJSONWithRetry[pendingRecording](baseURL, "/api/recordings", 3)
 	if err != nil {
-		return nil, fmt.Errorf("requesting recordings: %w", err)
-	}
-	defer resp.Body.Close() //nolint: errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code fetching recordings: %d", resp.StatusCode)
-	}
-
-	var allRecordings []APIResponseRecording
-	if err := json.NewDecoder(resp.Body).Decode(&allRecordings); err != nil {
-		return nil, fmt.Errorf("decoding recordings: %w", err)
+		return nil, err
 	}
 
 	var pending []types.Recording
-	for _, r := range allRecordings {
+	for _, r := range raw {
 		if r.Status == "pending" {
 			pending = append(pending, types.Recording{
 				ID:        r.ID,
@@ -233,8 +216,48 @@ func fetchPendingRecordings(baseURL string) ([]types.Recording, error) {
 	return pending, nil
 }
 
+func fetchJSONWithRetry[T any](baseURL, path string, maxRetries int) ([]T, error) {
+	url := baseURL + path
+	var result []T
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt*attempt) * time.Second
+			log.Printf("Retrying %s (attempt %d/%d) in %v...", url, attempt+1, maxRetries+1, backoff)
+			time.Sleep(backoff)
+		}
+
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Get(url)
+		if err != nil {
+			lastErr = fmt.Errorf("requesting %s: %w", url, err)
+			continue
+		}
+
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("Warning: error closing response body: %v", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("unexpected status code fetching %s: %d", url, resp.StatusCode)
+			continue
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			lastErr = fmt.Errorf("decoding %s: %w", url, err)
+			continue
+		}
+
+		return result, nil
+	}
+
+	return nil, lastErr
+}
+
 func loadGuideData(apiBaseURL string) (*types.Guide, error) {
-	resp, err := http.Get(apiBaseURL + "/api/guide")
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(apiBaseURL + "/api/guide")
 	if err != nil {
 		return nil, fmt.Errorf("fetching guide data: %w", err)
 	}

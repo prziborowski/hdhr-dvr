@@ -35,6 +35,12 @@ type RecordingRequest struct {
 	Title     *string `json:"title,omitempty"`
 }
 
+const (
+	PreRollSeconds = 30
+	PostRollMinutes = 1
+	queryTimeout   = 10 * time.Second
+)
+
 var (
 	db             *sql.DB
 	recordingCh    = make(chan types.Recording, 100)
@@ -170,12 +176,23 @@ func main() {
 		})
 
 		if activeCount > 0 {
-			log.Printf("WARNING: %d recording(s) in progress. Shutdown refused.", activeCount)
-			log.Println("Please wait for recordings to complete or use 'kill -9' to force terminate.")
-			shutdownMutex.Lock()
-			shutdownInProgress = false
-			shutdownMutex.Unlock()
-			return
+			log.Printf("WARNING: %d recording(s) in progress. Terminating...", activeCount)
+
+			// Terminate all running ffmpeg processes
+			runningProcesses.Range(func(key, value interface{}) bool {
+				if cmd, ok := value.(*exec.Cmd); ok && cmd.Process != nil {
+					log.Printf("Terminating recording %d...", key)
+					if err := cmd.Process.Kill(); err != nil {
+						log.Printf("Error killing recording %d: %v", key, err)
+					}
+				}
+				return true
+			})
+
+			// Wait a moment for processes to terminate
+			time.Sleep(2 * time.Second)
+
+			log.Println("Recordings terminated. Proceeding with shutdown...")
 		}
 
 		log.Println("No active recordings. Shutting down gracefully...")
@@ -191,12 +208,24 @@ func main() {
 }
 
 func updateRecording(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "PATCH" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if r.Header.Get("Content-Type") != "application/json" {
+		http.Error(w, "Content-Type must be application/json", http.StatusBadRequest)
+		return
+	}
+
 	idStr := mux.Vars(r)["id"]
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, "Invalid recording ID", http.StatusBadRequest)
 		return
 	}
+
+	ctx := r.Context()
 
 	var updateReq struct {
 		Title *string `json:"title"`
@@ -212,14 +241,17 @@ func updateRecording(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := db.Exec("UPDATE recordings SET title = ? WHERE id = ? AND status = 'pending'", *updateReq.Title, id)
+	result, err := dbExecContext(ctx, "UPDATE recordings SET title = ? WHERE id = ? AND status = 'pending'", *updateReq.Title, id)
 	if err != nil {
 		log.Printf("Error updating recording: %v", err)
 		http.Error(w, "Failed to update recording", http.StatusInternalServerError)
 		return
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Error getting rows affected: %v", err)
+	}
 	if rowsAffected == 0 {
 		http.Error(w, "Recording not found or not pending", http.StatusNotFound)
 		return
@@ -266,7 +298,14 @@ func createTables() {
 
 func loadChannels() {
 	log.Println("Fetching channels")
-	resp, err := http.Get("http://hdhomerun.local/lineup.json?show=found")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://hdhomerun.local/lineup.json?show=found", nil)
+	if err != nil {
+		log.Printf("Error creating channels request: %v", err)
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("Error fetching channels: %v", err)
 		return
@@ -294,38 +333,48 @@ func loadChannels() {
 		return
 	}
 
+	failedCount := 0
 	for _, ch := range chs {
 		_, err := tx.Exec("INSERT OR REPLACE INTO channels (guide_number, guide_name, url, enabled) VALUES (?, ?, ?, ?)",
 			ch.GuideNumber, ch.GuideName, ch.URL, ch.Enabled == nil || *ch.Enabled == 1)
 		if err != nil {
 			log.Printf("Error storing channel %s: %v", ch.GuideNumber, err)
+			failedCount++
 		}
+	}
+
+	if failedCount > 0 {
+		log.Printf("WARNING: %d channels failed to insert, rolling back transaction", failedCount)
+		tx.Rollback() //nolint: errcheck
+		return
 	}
 
 	if err := tx.Commit(); err != nil {
 		log.Printf("Error committing channels transaction: %v", err)
+		tx.Rollback() //nolint: errcheck
 	}
 }
 
 func loadRecordings() {
 	log.Println("Load recordings")
-	// Use a transaction for the database operations
-	tx, err := db.Begin()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		log.Printf("Error starting database transaction: %v", err)
 		return
 	}
-	// Get all recordings from database
-	rows, err := tx.Query(`
+	defer tx.Rollback() //nolint: errcheck
+
+	rows, err := tx.QueryContext(ctx, `
         SELECT id, channel_id, date, start_time, duration, status, title, file_size
         FROM recordings
     `)
 	if err != nil {
 		log.Printf("Error loading recordings: %v", err)
-		tx.Rollback() //nolint: errcheck
 		return
 	}
-	defer rows.Close() //nolint: errcheck
 
 	loc, _ := getLocalLocation()
 	now := time.Now().In(loc)
@@ -338,7 +387,6 @@ func loadRecordings() {
 			continue
 		}
 
-		// Check if recording time has passed
 		dateTimeStr := fmt.Sprintf("%s %s", r.Date, r.StartTime)
 		startTime, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
 		if err != nil {
@@ -346,21 +394,17 @@ func loadRecordings() {
 			continue
 		}
 
-		// Calculate end time (with pre-roll and post-roll)
-		adjustedStartTime := startTime.Add(-30 * time.Second)
-		endTime := adjustedStartTime.Add(time.Duration(r.Duration+1) * time.Minute)
+		adjustedStartTime := startTime.Add(-PreRollSeconds * time.Second)
+		endTime := adjustedStartTime.Add(time.Duration(r.Duration+PostRollMinutes) * time.Minute)
 
-		// Skip if recording has already passed
 		if now.After(endTime) {
 			log.Printf("Skipping recording %d - already ended at %v", r.ID, endTime)
 			continue
 		}
 
-		// Check if recording time has passed
 		newStatus := r.CheckStatus(db, loc, config.StorageDir)
-		// Update status if needed
 		if r.Status != newStatus {
-			_, err := tx.Exec("UPDATE recordings SET status = ? WHERE id = ?", newStatus, r.ID)
+			_, err := tx.ExecContext(ctx, "UPDATE recordings SET status = ? WHERE id = ?", newStatus, r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
 			} else {
@@ -369,23 +413,23 @@ func loadRecordings() {
 			}
 		}
 
-		// Check if recording should start now
 		if now.After(adjustedStartTime) && now.Before(endTime) {
-			// Recording is already in progress
 			log.Printf("Recording %d is already in progress", r.ID)
 		} else if now.Before(adjustedStartTime) {
-			// Schedule recording for later
 			recordingCh <- r
 		} else {
-			// Recording should have started already
 			log.Printf("Recording %d should have started at %v", r.ID, adjustedStartTime)
-			// Start it immediately
 			go startRecording(r)
 		}
 	}
-	// Commit the transaction
+	if err := rows.Err(); err != nil {
+		log.Printf("Error iterating recordings: %v", err)
+	}
+	rows.Close()
+
 	if err := tx.Commit(); err != nil {
 		log.Printf("Error committing transaction: %v", err)
+		tx.Rollback() //nolint: errcheck
 		return
 	}
 }
@@ -403,26 +447,30 @@ func startRecordingScheduler() {
 		select {
 		case <-ticker.C:
 			now := time.Now().In(loc)
-			// Load recordings from database
-			rows, err := db.Query(`
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			rows, err := db.QueryContext(ctx, `
                 SELECT id, channel_id, date, start_time, duration, status, title
                 FROM recordings
                 WHERE status = 'pending'
             `)
+			cancel()
 			if err != nil {
 				log.Printf("Error loading recordings: %v", err)
 				continue
 			}
-			var recordings []types.Recording
-			for rows.Next() {
-				var r types.Recording
-				if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status, &r.Title); err != nil {
-					log.Printf("Error scanning recording: %v", err)
-					continue
-				}
-				recordings = append(recordings, r)
+		var recordings []types.Recording
+		for rows.Next() {
+			var r types.Recording
+			if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status, &r.Title); err != nil {
+				log.Printf("Error scanning recording: %v", err)
+				continue
 			}
-			rows.Close() //nolint: errcheck
+			recordings = append(recordings, r)
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("Error iterating recordings: %v", err)
+		}
+		rows.Close() //nolint: errcheck
 
 			// Start a precise timer for each recording
 			for _, r := range recordings {
@@ -437,26 +485,26 @@ func startRecordingScheduler() {
 					continue
 				}
 
-				// Calculate the actual start time (30 seconds before scheduled time)
-				actualStartTime := startTime.Add(-30 * time.Second)
+			// Calculate the actual start time (30 seconds before scheduled time)
+			actualStartTime := startTime.Add(-PreRollSeconds * time.Second)
 
 				// Only schedule if the recording hasn't already started
 				if now.Before(actualStartTime) {
 					// Start a precise timer for this recording
 					go startRecordingTimer(r, actualStartTime)
-				} else if now.Before(startTime.Add(time.Duration(r.Duration) * time.Minute)) {
+				} else if now.Before(startTime.Add(time.Duration(r.Duration+PostRollMinutes)*time.Minute)) {
 					// Recording should have started already, start it immediately
 					log.Printf("Recording %d should have started at %v, starting now", r.ID, actualStartTime)
 					go startRecording(r)
-				} else {
-					// Recording time has passed, mark as failed
-					log.Printf("Recording %d should have started at %v but it's now %v, marking as failed",
-						r.ID, actualStartTime, now)
-					_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
-					if err != nil {
-						log.Printf("Error updating recording status: %v", err)
-					}
+			} else {
+				// Recording time has passed, mark as failed
+				log.Printf("Recording %d should have started at %v but it's now %v, marking as failed",
+					r.ID, actualStartTime, now)
+				_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+				if err != nil {
+					log.Printf("Error updating recording status: %v", err)
 				}
+			}
 			}
 		case <-recordingCh:
 			// Recording was already stored in database in createRecording
@@ -467,6 +515,24 @@ func startRecordingScheduler() {
 
 // Track active recording timers
 var recordingTimers sync.Map // key: recording ID, value: struct{}
+
+func dbQueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+	return db.QueryContext(ctx, query, args...)
+}
+
+func dbExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+	return db.ExecContext(ctx, query, args...)
+}
+
+func dbQueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+	return db.QueryRowContext(ctx, query, args...)
+}
 
 // startRecordingTimer starts a precise timer for a recording
 func startRecordingTimer(r types.Recording, startTime time.Time) {
@@ -483,8 +549,10 @@ func startRecordingTimer(r types.Recording, startTime time.Time) {
 	}
 
 	// Check if the recording still exists and hasn't been deleted
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	var exists bool
-	err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM recordings WHERE id = ? AND status = 'pending')", r.ID).Scan(&exists)
+	err := dbQueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recordings WHERE id = ? AND status = 'pending')", r.ID).Scan(&exists)
+	cancel()
 	if err != nil {
 		log.Printf("Error checking if recording %d exists: %v", r.ID, err)
 		return
@@ -497,19 +565,21 @@ func startRecordingTimer(r types.Recording, startTime time.Time) {
 
 	// Start the recording
 	log.Printf("Starting recording %d at %v (scheduled for %v)",
-		r.ID, time.Now(), startTime.Add(30*time.Second))
+		r.ID, time.Now(), startTime.Add(PreRollSeconds*time.Second))
 	go startRecording(r)
 }
 
 func startRecording(r types.Recording) {
 	// First check: validate channel exists and get its info
 	var ch types.Channel
-	err := db.QueryRow("SELECT guide_number, guide_name, url FROM channels WHERE guide_number = ?", r.ChannelID).Scan(
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err := dbQueryRowContext(ctx, "SELECT guide_number, guide_name, url FROM channels WHERE guide_number = ?", r.ChannelID).Scan(
 		&ch.GuideNumber, &ch.GuideName, &ch.URL)
+	cancel()
 	if err != nil {
 		log.Printf("Error finding channel %s: %v", r.ChannelID, err)
 		// Mark as failed in a separate transaction
-		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 		if err != nil {
 			log.Printf("Error updating recording status: %v", err)
 		}
@@ -528,17 +598,15 @@ func startRecording(r types.Recording) {
 	startTime, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
 	if err != nil {
 		log.Printf("Error parsing start time: %v", err)
-		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 		if err != nil {
 			log.Printf("Error updating recording status: %v", err)
 		}
 		return
 	}
 
-	// Adjust start time by subtracting 30 seconds
-	adjustedStartTime := startTime.Add(-30 * time.Second)
-	// Adjust duration by adding 30 seconds
-	adjustedDuration := r.Duration + 1 // Adding 1 minute total (30s pre + 30s post)
+	adjustedStartTime := startTime.Add(-PreRollSeconds * time.Second)
+	adjustedDuration := r.Duration + PostRollMinutes
 
 	log.Printf("Original start time: %v, Adjusted start time: %v, Original duration: %d, Adjusted duration: %d",
 		startTime, adjustedStartTime, r.Duration, adjustedDuration)
@@ -547,7 +615,7 @@ func startRecording(r types.Recording) {
 	if err := os.MkdirAll(config.StorageDir, 0755); err != nil {
 		log.Printf("Error creating output directory: %v", err)
 		// Mark as failed in a separate transaction
-		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 		if err != nil {
 			log.Printf("Error updating recording status: %v", err)
 		}
@@ -562,7 +630,7 @@ func startRecording(r types.Recording) {
 	if err != nil {
 		log.Printf("Error creating log file: %v", err)
 		// Mark as failed in a separate transaction
-		_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+		_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 		if err != nil {
 			log.Printf("Error updating recording status: %v", err)
 		}
@@ -588,69 +656,58 @@ func startRecording(r types.Recording) {
 	cmd.Stdout = logFileHandle
 	cmd.Stderr = logFileHandle
 
-	// Update status to "recording" in a separate transaction
-	// Use a retry mechanism for database operations
-	var updateErr error
+	// Update status to "recording" with retry logic
 	retryCount := 0
 	maxRetries := 3
 	for retryCount < maxRetries {
-		tx, err := db.Begin()
+		txCtx, txCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		tx, err := db.BeginTx(txCtx, nil)
+		txCancel()
 		if err != nil {
 			log.Printf("Error starting database transaction: %v", err)
 			retryCount++
 			if retryCount < maxRetries {
-				time.Sleep(100 * time.Millisecond) // Wait before retry
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			// Mark as failed in a separate transaction
-			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
 			}
 			return
 		}
 
-		_, err = tx.Exec("UPDATE recordings SET status = 'recording' WHERE id = ?", r.ID)
+		_, err = tx.ExecContext(context.Background(), "UPDATE recordings SET status = 'recording' WHERE id = ?", r.ID)
 		if err != nil {
 			log.Printf("Error updating recording status to 'recording': %v", err)
 			tx.Rollback() //nolint: errcheck
-			tx = nil
 			retryCount++
 			if retryCount < maxRetries {
-				time.Sleep(100 * time.Millisecond) // Wait before retry
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			// Mark as failed in a separate transaction
-			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
 			}
 			return
 		}
 
-		// Commit the status update transaction
 		if err := tx.Commit(); err != nil {
 			log.Printf("Error committing transaction: %v", err)
-			tx = nil
+			tx.Rollback() //nolint: errcheck
 			retryCount++
 			if retryCount < maxRetries {
-				time.Sleep(100 * time.Millisecond) // Wait before retry
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			// Mark as failed in a separate transaction
-			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
 			}
 			return
 		}
-		tx = nil
-		updateErr = nil
 		break
-	}
-
-	if updateErr != nil {
-		return
 	}
 
 	// Track the process
@@ -694,13 +751,13 @@ func startRecording(r types.Recording) {
 		// Check if file was created despite the error
 		if _, err := os.Stat(outputFile); err == nil {
 			// File exists, mark as completed
-			_, err := db.Exec("UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
+			_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
 			}
 		} else {
 			// File doesn't exist, mark as failed
-			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
 			}
@@ -711,57 +768,53 @@ func startRecording(r types.Recording) {
 	// Update status to "completed" with retry logic
 	retryCount = 0
 	for retryCount < maxRetries {
-		tx, err := db.Begin()
+		txCtx, txCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		tx, err := db.BeginTx(txCtx, nil)
+		txCancel()
 		if err != nil {
 			log.Printf("Error starting database transaction: %v", err)
 			retryCount++
 			if retryCount < maxRetries {
-				time.Sleep(100 * time.Millisecond) // Wait before retry
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			// Mark as failed in a separate transaction
-			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
 			}
 			return
 		}
 
-		_, err = tx.Exec("UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
+		_, err = tx.ExecContext(context.Background(), "UPDATE recordings SET status = 'completed' WHERE id = ?", r.ID)
 		if err != nil {
 			log.Printf("Error updating recording status to 'completed': %v", err)
 			tx.Rollback() //nolint: errcheck
-			tx = nil
 			retryCount++
 			if retryCount < maxRetries {
-				time.Sleep(100 * time.Millisecond) // Wait before retry
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			// Mark as failed in a separate transaction
-			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
 			}
 			return
 		}
 
-		// Commit the status update transaction
 		if err := tx.Commit(); err != nil {
 			log.Printf("Error committing transaction: %v", err)
-			tx = nil
+			tx.Rollback() //nolint: errcheck
 			retryCount++
 			if retryCount < maxRetries {
-				time.Sleep(100 * time.Millisecond) // Wait before retry
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			// Mark as failed in a separate transaction
-			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+			_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
 			if err != nil {
 				log.Printf("Error updating recording status: %v", err)
 			}
 			return
 		}
-		tx = nil
 		break
 	}
 
@@ -774,16 +827,16 @@ func startRecording(r types.Recording) {
 		// Optional: remove original TS file after successful conversion
 		_ = os.Remove(outputFile)
 
-		// Get final file size and update database
-		if info, err := os.Stat(mp4File); err == nil {
-			size := info.Size()
-			_, err := db.Exec("UPDATE recordings SET file_size = ? WHERE id = ?", size, r.ID)
-			if err != nil {
-				log.Printf("Error updating recording file size: %v", err)
-			}
-		} else {
-			log.Printf("Error getting final recording file size: %v", err)
+	// Get final file size and update database
+	if info, err := os.Stat(mp4File); err == nil {
+		size := info.Size()
+		_, err := dbExecContext(context.Background(), "UPDATE recordings SET file_size = ? WHERE id = ?", size, r.ID)
+		if err != nil {
+			log.Printf("Error updating recording file size: %v", err)
 		}
+	} else {
+		log.Printf("Error getting final recording file size: %v", err)
+	}
 	}
 
 	// Final log message
@@ -802,7 +855,7 @@ func convertToMp4(tsFile, mp4File string) error {
 	}
 	cmd := exec.Command("ffmpeg", args...)
 	if err := cmd.Run(); err != nil {
-		log.Printf("ffmpeg conversion failed: %w, attempting slower conversion", err)
+		log.Printf("ffmpeg conversion failed: %v, attempting slower conversion", err)
 
 		args = []string{
 			"-err_detect", "ignore_err",
@@ -866,15 +919,14 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 
 // getChannels returns the list of available channels
 func getChannels(w http.ResponseWriter, r *http.Request) {
-	// Get channels from database
-	rows, err := db.Query("SELECT guide_number, guide_name FROM channels WHERE enabled=1")
+	ctx := r.Context()
+	rows, err := dbQueryContext(ctx, "SELECT guide_number, guide_name FROM channels WHERE enabled=1")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close() //nolint: errcheck
+	defer rows.Close()
 
-	// Define the struct with proper JSON tags
 	type channelResponse struct {
 		GuideNumber string `json:"guideNumber"`
 		GuideName   string `json:"guideName"`
@@ -890,9 +942,14 @@ func getChannels(w http.ResponseWriter, r *http.Request) {
 		}
 		channelList = append(channelList, ch)
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Error iterating channels: %v", err)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(channelList) //nolint: errcheck
+	if err := json.NewEncoder(w).Encode(channelList); err != nil {
+		log.Printf("Error encoding channels response: %v", err)
+	}
 }
 
 type GetRecordingsRec struct {
@@ -909,19 +966,19 @@ type GetRecordingsRec struct {
 }
 
 func getRecordings(w http.ResponseWriter, r *http.Request) {
-	// Get recordings with channel information
-	rows, err := db.Query(`
+	ctx := r.Context()
+	rows, err := dbQueryContext(ctx, `
         SELECT r.id, r.channel_id, r.date, r.start_time, r.duration, r.status, r.title, r.file_size,
                c.guide_number, c.guide_name
         FROM recordings r
         LEFT JOIN channels c ON r.channel_id = c.guide_number
-		  ORDER BY r.date, r.start_time
+	  ORDER BY r.date, r.start_time
     `)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close() //nolint: errcheck
+	defer rows.Close()
 
 	var recordings []GetRecordingsRec
 
@@ -934,12 +991,18 @@ func getRecordings(w http.ResponseWriter, r *http.Request) {
 		}
 		recordings = append(recordings, r)
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Error iterating recordings: %v", err)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(recordings) //nolint: errcheck
+	if err := json.NewEncoder(w).Encode(recordings); err != nil {
+		log.Printf("Error encoding recordings response: %v", err)
+	}
 }
 
 func getRecordingFile(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	// Debug: Log all request headers
 	log.Printf("Request headers for recording file:")
 	for name, values := range r.Header {
@@ -959,7 +1022,7 @@ func getRecordingFile(w http.ResponseWriter, r *http.Request) {
 	// Get recording from database
 	var recording types.Recording
 	var channelName string
-	err = db.QueryRow(`
+	err = dbQueryRowContext(ctx, `
         SELECT r.id, r.channel_id, r.date, r.start_time, r.duration, r.status, r.title,
                c.guide_name
         FROM recordings r
@@ -1107,6 +1170,13 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Header.Get("Content-Type") != "application/json" {
+		http.Error(w, "Content-Type must be application/json", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+
 	var req RecordingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1125,7 +1195,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 
 	// Verify channel exists
 	var exists bool
-	err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM channels WHERE guide_number = ?)", req.ChannelID).Scan(&exists)
+	err := dbQueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM channels WHERE guide_number = ?)", req.ChannelID).Scan(&exists)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1141,7 +1211,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 
 	// Check for duplicate recording (channel + date + start time)
 	var duplicateExists bool
-	err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM recordings WHERE channel_id = ? AND date = ? AND start_time = ?)", req.ChannelID, req.Date, req.StartTime).Scan(&duplicateExists)
+	err = dbQueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recordings WHERE channel_id = ? AND date = ? AND start_time = ?)", req.ChannelID, req.Date, req.StartTime).Scan(&duplicateExists)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1165,7 +1235,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	reqEnd := reqStart.Add(time.Duration(req.Duration) * time.Minute)
 
 	// Query recordings that overlap with the requested interval
-	rows, err := db.Query(`
+	rows, err := dbQueryContext(ctx, `
 		SELECT date, start_time, duration
 		FROM recordings
 		WHERE datetime(date || ' ' || start_time) < datetime(?, '+' || ? || ' minutes')
@@ -1217,11 +1287,14 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Use a transaction for the database operations
-	tx, err := db.Begin()
+	txCtx, txCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer txCancel()
+	tx, err := db.BeginTx(txCtx, nil)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
+	defer tx.Rollback() //nolint: errcheck
 
 	// Create new recording
 	recording := types.Recording{
@@ -1234,12 +1307,11 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Store in database
-	result, err := tx.Exec(`
+	result, err := tx.ExecContext(ctx, `
         INSERT INTO recordings (channel_id, date, start_time, duration, status, title)
         VALUES (?, ?, ?, ?, ?, ?)
     `, recording.ChannelID, recording.Date, recording.StartTime, recording.Duration, recording.Status, recording.Title)
 	if err != nil {
-		tx.Rollback() //nolint: errcheck
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{ //nolint: errcheck
@@ -1251,7 +1323,6 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	// Get the ID of the newly inserted recording
 	id, err := result.LastInsertId()
 	if err != nil {
-		tx.Rollback() //nolint: errcheck
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{ //nolint: errcheck
@@ -1264,6 +1335,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 	// Commit the transaction
 	if err := tx.Commit(); err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
+		tx.Rollback() //nolint: errcheck
 		return
 	}
 
@@ -1281,6 +1353,8 @@ func deleteRecording(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	ctx := r.Context()
 	// Extract ID from URL
 	idStr := mux.Vars(r)["id"]
 	id, err := strconv.Atoi(idStr)
@@ -1290,7 +1364,7 @@ func deleteRecording(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Delete from database
-	_, err = db.Exec("DELETE FROM recordings WHERE id = ?", id)
+	_, err = dbExecContext(ctx, "DELETE FROM recordings WHERE id = ?", id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1303,12 +1377,13 @@ func deleteRecording(w http.ResponseWriter, r *http.Request) {
 }
 
 func getKeywords(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT id, name, category, enabled, created_at FROM keywords ORDER BY created_at DESC")
+	ctx := r.Context()
+	rows, err := dbQueryContext(ctx, "SELECT id, name, category, enabled, created_at FROM keywords ORDER BY created_at DESC")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close() //nolint: errcheck
+	defer rows.Close()
 
 	var keywords []types.Keyword
 	for rows.Next() {
@@ -1323,14 +1398,24 @@ func getKeywords(w http.ResponseWriter, r *http.Request) {
 		k.Enabled = enabled == 1
 		keywords = append(keywords, k)
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Error iterating keywords: %v", err)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(keywords) //nolint: errcheck
+	if err := json.NewEncoder(w).Encode(keywords); err != nil {
+		log.Printf("Error encoding keywords response: %v", err)
+	}
 }
 
 func createKeyword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if r.Header.Get("Content-Type") != "application/json" {
+		http.Error(w, "Content-Type must be application/json", http.StatusBadRequest)
 		return
 	}
 
@@ -1407,13 +1492,11 @@ func deleteKeyword(w http.ResponseWriter, r *http.Request) {
 }
 
 func getLocalLocation() (*time.Location, error) {
-	// Try to get system timezone
-	tz, err := time.LoadLocation("America/Los_Angeles")
+	loc, err := time.LoadLocation("America/Los_Angeles")
 	if err != nil {
-		// Fallback to UTC if system timezone can't be determined
 		return time.UTC, nil
 	}
-	return tz, nil
+	return loc, nil
 }
 
 // Load the guide data from file
@@ -1430,12 +1513,17 @@ func loadGuide() bool {
 	}
 	defer file.Close() //nolint: errcheck
 
-	if err := json.NewDecoder(file).Decode(&guideData); err != nil {
+	var newGuideData map[string]interface{}
+	if err := json.NewDecoder(file).Decode(&newGuideData); err != nil {
 		log.Printf("Error decoding guide.json: %v", err)
 		return false
-	} else {
-		log.Println("Loaded guide data")
 	}
+
+	guideDataMutex.Lock()
+	guideData = newGuideData
+	guideDataMutex.Unlock()
+
+	log.Println("Loaded guide data")
 	return true
 }
 
@@ -1446,8 +1534,6 @@ func setupFileWatcher(filePath string) {
 		log.Fatal(err)
 	}
 	defer watcher.Close() //nolint: errcheck
-
-	done := make(chan bool)
 
 	go func() {
 		for {
@@ -1474,7 +1560,8 @@ func setupFileWatcher(filePath string) {
 		log.Printf("Error adding watcher for %s: %v", filePath, err)
 		return
 	}
-	<-done
+
+	select {}
 }
 
 func getGuide(w http.ResponseWriter, r *http.Request) {
@@ -1483,11 +1570,8 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	guideDataMutex.RLock()
-	defer guideDataMutex.RUnlock()
-
-	// Get current local channels from database to filter guide
-	rows, err := db.Query("SELECT guide_number FROM channels WHERE enabled=1")
+	ctx := r.Context()
+	rows, err := dbQueryContext(ctx, "SELECT guide_number FROM channels WHERE enabled=1")
 	if err != nil {
 		log.Printf("Error fetching valid channels: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -1504,11 +1588,17 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 		}
 		channelMap[chNum] = true
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Error iterating channels for guide: %v", err)
+	}
 
-	// Check if programs exist in guide data
-	if programs, ok := guideData["programs"].([]interface{}); ok {
-		var filteredPrograms []map[string]interface{}
+	var filteredPrograms []map[string]interface{}
 
+	guideDataMutex.RLock()
+	programs, ok := guideData["programs"].([]interface{})
+	guideDataMutex.RUnlock()
+
+	if ok {
 		now := time.Now()
 		for _, progInterface := range programs {
 			progMap, ok := progInterface.(map[string]interface{})
@@ -1516,15 +1606,12 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// Filter out programs not in the local channel list
 			channelNum, ok := progMap["channel"].(string)
 			if !ok || !channelMap[channelNum] {
 				continue
 			}
 
-			// Convert start and end times to Go time objects
 			endTimeStr, endOk := progMap["end"].(string)
-
 			if !endOk {
 				continue
 			}
@@ -1535,7 +1622,6 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// Skip programs that have already ended
 			if endTime.Before(now) {
 				continue
 			}
@@ -1543,38 +1629,37 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 			filteredPrograms = append(filteredPrograms, progMap)
 		}
 
-		// Sort programs by start time and channel number
 		sort.Slice(filteredPrograms, func(i, j int) bool {
 			startI := filteredPrograms[i]["start"].(string)
 			startJ := filteredPrograms[j]["start"].(string)
 			channelI := filteredPrograms[i]["channel"].(string)
 			channelJ := filteredPrograms[j]["channel"].(string)
 
-			// First sort by start time
 			if startI != startJ {
 				return startI < startJ
 			}
-			// Then sort by channel number (ascending order)
 			return channelI < channelJ
 		})
-
-		// Replace programs with sorted/filtered version in guide data
-		guideData["programs"] = filteredPrograms
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(guideData) //nolint: errcheck
+	if err := json.NewEncoder(w).Encode(filteredPrograms); err != nil {
+		log.Printf("Error encoding guide response: %v", err)
+	}
 }
 
 func cleanupOldRecordings() {
 	log.Println("Cleaning up old recordings")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	loc, err := getLocalLocation()
 	if err != nil {
 		log.Printf("Error determining timezone: %v", err)
 		loc = time.UTC
 	}
 
-	rows, err := db.Query(`
+	rows, err := dbQueryContext(ctx, `
         SELECT id, date, start_time, duration
         FROM recordings
         WHERE status IN ('pending', 'recording')
@@ -1610,10 +1695,13 @@ func cleanupOldRecordings() {
 			continue
 		}
 
-		adjustedStartTime := startTimeParsed.Add(-30 * time.Second)
-		endTime := adjustedStartTime.Add(time.Duration(duration+1) * time.Minute)
+		adjustedStartTime := startTimeParsed.Add(-PreRollSeconds * time.Second)
+		endTime := adjustedStartTime.Add(time.Duration(duration+PostRollMinutes) * time.Minute)
 
 		toUpdate = append(toUpdate, recordingInfo{id, endTime})
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Error iterating recordings for cleanup: %v", err)
 	}
 	rows.Close() // nolint: errcheck — close cursor before writing to avoid SQLite lock
 
@@ -1622,7 +1710,7 @@ func cleanupOldRecordings() {
 
 	for _, info := range toUpdate {
 		if now.After(info.endTime) {
-			_, err := db.Exec("UPDATE recordings SET status = 'failed' WHERE id = ?", info.id)
+			_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", info.id)
 			if err != nil {
 				log.Printf("Error updating recording %d status to failed: %v", info.id, err)
 			} else {
@@ -1652,7 +1740,15 @@ type DiscoveryResponse struct {
 
 func fetchTunerCount() int {
 	defaultCount := 4
-	resp, err := http.Get("http://hdhomerun.local/discover.json")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://hdhomerun.local/discover.json", nil)
+	if err != nil {
+		log.Printf("Error creating tuner count request: %v, using default %d", err, defaultCount)
+		cancel()
+		return defaultCount
+	}
+	resp, err := http.DefaultClient.Do(req)
+	cancel()
 	if err != nil {
 		log.Printf("Error fetching tuner count: %v, using default %d", err, defaultCount)
 		return defaultCount

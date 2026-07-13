@@ -3,6 +3,7 @@ package types
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,18 +63,22 @@ func (r *Recording) GetFilePath() string {
 	return outputFile
 }
 
+const (
+	PreRollSeconds = 30
+	PostRollMinutes = 1
+)
+
 func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir string) string {
-	// Construct the expected file path
 	var channelName string
 	err := db.QueryRow("SELECT guide_name FROM channels WHERE guide_number = ?", r.ChannelID).Scan(&channelName)
 	if err != nil {
+		log.Printf("Error looking up channel %s for recording %d status: %v", r.ChannelID, r.ID, err)
 		return "failed"
 	}
 
 	filePathTS := filepath.Join(storageDir, r.GetFilePath())
 	filePathMP4 := strings.TrimSuffix(filePathTS, filepath.Ext(filePathTS)) + ".mp4"
 
-	// Check if either TS or MP4 file exists
 	fileExists := false
 	if _, err := os.Stat(filePathTS); err == nil {
 		fileExists = true
@@ -81,14 +86,14 @@ func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir strin
 		fileExists = true
 	}
 
-	// Calculate end time (with pre-roll)
 	dateTimeStr := fmt.Sprintf("%s %s", r.Date, r.StartTime)
 	startTime, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
 	if err != nil {
+		log.Printf("Error parsing start time for recording %d: %v", r.ID, err)
 		return "failed"
 	}
 
-	endTime := startTime.Add(time.Duration(r.Duration+1) * time.Minute) // +1 for pre-roll
+	endTime := startTime.Add(time.Duration(r.Duration+PostRollMinutes) * time.Minute)
 	now := time.Now().In(loc)
 
 	if !fileExists {
@@ -100,7 +105,6 @@ func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir strin
 		return "failed"
 	}
 
-	// File exists: check if we are still within the recording window
 	if now.Before(endTime) {
 		return "recording"
 	}

@@ -31,21 +31,25 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	if config.StorageDir == "" {
-		log.Fatalf("storageDir cannot be unset")
-	}
-
 	if config.Timezone == "" {
 		config.Timezone = "America/Los_Angeles"
+		log.Println("WARNING: timezone not set, defaulting to America/Los_Angeles")
 	}
 	if config.Days == 0 || config.Days > 8 {
+		log.Printf("WARNING: days=%d is invalid, clamping to 8", config.Days)
 		config.Days = 8
 	}
 	if config.GuideFile == "" {
 		config.GuideFile = "guide.json"
+		log.Println("WARNING: guideFile not set, defaulting to guide.json")
 	}
 	if config.StateFile == "" {
 		config.StateFile = "guide_state.json"
+		log.Println("WARNING: stateFile not set, defaulting to guide_state.json")
+	}
+
+	if config.StorageDir == "" {
+		log.Fatalf("storageDir cannot be unset")
 	}
 
 	return &config, nil

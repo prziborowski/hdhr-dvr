@@ -51,6 +51,9 @@ func main() {
 			title sql.NullString
 		}{r, title})
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Error iterating recordings: %v", err)
+	}
 	rows.Close() // Close rows before performing updates to avoid database lock
 
 	count := 0
