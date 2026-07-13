@@ -1,0 +1,2 @@
+Whenever you modify any Go files, you must verify that the changes do not break the build. 
+Run `go build ./...` to check all packages. If `go build ./...` fails due to the root package missing a main function (which is expected in this project), ensure that the specific package being modified still compiles by running `go build ./<package_path>`.

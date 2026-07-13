@@ -39,6 +39,7 @@ var (
 	db             *sql.DB
 	recordingCh    = make(chan types.Recording, 100)
 	config         *pkgcfg.Config
+	tunerCount     int
 	guideData      map[string]interface{}
 	guideDataMutex sync.RWMutex
 	watcher        *fsnotify.Watcher
@@ -81,6 +82,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	tunerCount = fetchTunerCount()
+	log.Printf("System initialized with %d tuners", tunerCount)
 
 	// Create tables if they don't exist
 	createTables()
@@ -651,9 +655,42 @@ func startRecording(r types.Recording) {
 
 	// Track the process
 	runningProcesses.Store(r.ID, cmd)
+	defer runningProcesses.Delete(r.ID)
 	// Start recording (no database transaction held during this operation)
-	if err := cmd.Run(); err != nil {
-		log.Printf("Error running ffmpeg: %v", err)
+
+	var runErr error
+	retryCount = 0
+	maxRetries = 3
+	backoff := []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second}
+
+	for retryCount <= maxRetries {
+		runErr = cmd.Run()
+		if runErr == nil {
+			break
+		}
+
+		log.Printf("Error running ffmpeg (attempt %d/%d): %v", retryCount+1, maxRetries+1, runErr)
+
+		if isHttpServerError(logFile) && retryCount < maxRetries {
+			wait := backoff[retryCount]
+			log.Printf("Detected HTTP server error, retrying in %v...", wait)
+			time.Sleep(wait)
+
+			// Re-create the command because exec.Cmd cannot be reused
+			ffmpegArgs := buildFFmpegArgs(ch.URL, durationSeconds, outputFile)
+			cmd = exec.Command("ffmpeg", ffmpegArgs...)
+			cmd.Stdout = logFileHandle
+			cmd.Stderr = logFileHandle
+			runningProcesses.Store(r.ID, cmd)
+
+			retryCount++
+			continue
+		}
+		break
+	}
+
+	if runErr != nil {
+		log.Printf("Error running ffmpeg after retries: %v", runErr)
 		// Check if file was created despite the error
 		if _, err := os.Stat(outputFile); err == nil {
 			// File exists, mark as completed
@@ -727,9 +764,6 @@ func startRecording(r types.Recording) {
 		tx = nil
 		break
 	}
-
-	// Remove from running processes
-	runningProcesses.Delete(r.ID)
 
 	// Perform fast conversion from TS to MP4
 	mp4File := strings.TrimSuffix(outputFile, filepath.Ext(outputFile)) + ".mp4"
@@ -1173,7 +1207,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 		currentTuners += e.diff
 		// Check if the current count exceeds capacity within the requested window
 		if (e.t.After(reqStart) || e.t.Equal(reqStart)) && (e.t.Before(reqEnd) || e.t.Equal(reqEnd)) {
-			if currentTuners >= 4 {
+			if currentTuners >= tunerCount-1 {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusConflict)
 				json.NewEncoder(w).Encode(map[string]string{"error": "No tuners available during this time period"})
@@ -1589,4 +1623,42 @@ func cleanupOldRecordings() {
 	}
 
 	log.Printf("Cleaned up %d old recordings", updatedCount)
+}
+
+func isHttpServerError(logFile string) bool {
+	content, err := os.ReadFile(logFile)
+	if err != nil {
+		return false
+
+	}
+	output := string(content)
+	return strings.Contains(output, "HTTP error 503") ||
+		strings.Contains(output, "Server returned 5XX Server Error")
+}
+
+type DiscoveryResponse struct {
+	TunerCount int `json:"TunerCount"`
+}
+
+func fetchTunerCount() int {
+	defaultCount := 4
+	resp, err := http.Get("http://hdhomerun.local/discover.json")
+	if err != nil {
+		log.Printf("Error fetching tuner count: %v, using default %d", err, defaultCount)
+		return defaultCount
+	}
+	defer resp.Body.Close()
+
+	var disc DiscoveryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&disc); err != nil {
+		log.Printf("Error decoding tuner count: %v, using default %d", err, defaultCount)
+		return defaultCount
+	}
+
+	if disc.TunerCount <= 0 {
+		log.Printf("Invalid TunerCount %d received, using default %d", disc.TunerCount, defaultCount)
+		return defaultCount
+	}
+
+	return disc.TunerCount
 }
