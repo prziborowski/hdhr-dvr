@@ -10,20 +10,20 @@ func TestLoadConfig_ValidAllFields(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.json")
 	configContent := `{
-		"timezone": "America/New_York",
-		"lineUpID": "test-lineup",
-		"days": 5,
-		"guideFile": "epg.json",
-		"stateFile": "state.json",
-		"storageDir": "/tmp/recordings",
-		"userId": "test-user-id"
-	}`
+				"timezone": "America/New_York",
+				"lineUpID": "test-lineup",
+				"days": 5,
+				"guideFile": "epg.json",
+				"stateFile": "state.json",
+				"storageDir": "/tmp/recordings",
+				"userId": "test-user-id"
+			}`
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(wd)
+	os.Chdir(tmpDir)   //nolint:errcheck
+	defer os.Chdir(wd) //nolint:errcheck
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -42,15 +42,15 @@ func TestLoadConfig_DefaultTimezone(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.json")
 	configContent := `{
-		"lineUpID": "test",
-		"storageDir": "/tmp/rec"
-	}`
+				"lineUpID": "test",
+				"storageDir": "/tmp/rec"
+			}`
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(wd)
+	os.Chdir(tmpDir)   //nolint:errcheck
+	defer os.Chdir(wd) //nolint:errcheck
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -63,16 +63,16 @@ func TestLoadConfig_DaysClampedTo8_Zero(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.json")
 	configContent := `{
-		"lineUpID": "test",
-		"days": 0,
-		"storageDir": "/tmp/rec"
-	}`
+				"lineUpID": "test",
+				"days": 0,
+				"storageDir": "/tmp/rec"
+			}`
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(wd)
+	os.Chdir(tmpDir)   //nolint:errcheck
+	defer os.Chdir(wd) //nolint:errcheck
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -85,16 +85,16 @@ func TestLoadConfig_DaysClampedTo8_GreaterThan8(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.json")
 	configContent := `{
-		"lineUpID": "test",
-		"days": 14,
-		"storageDir": "/tmp/rec"
-	}`
+				"lineUpID": "test",
+				"days": 14,
+				"storageDir": "/tmp/rec"
+			}`
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(wd)
+	os.Chdir(tmpDir)   //nolint:errcheck
+	defer os.Chdir(wd) //nolint:errcheck
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -107,15 +107,15 @@ func TestLoadConfig_DefaultGuideFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.json")
 	configContent := `{
-		"lineUpID": "test",
-		"storageDir": "/tmp/rec"
-	}`
+				"lineUpID": "test",
+				"storageDir": "/tmp/rec"
+			}`
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(wd)
+	os.Chdir(tmpDir)   //nolint:errcheck
+	defer os.Chdir(wd) //nolint:errcheck
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -128,15 +128,15 @@ func TestLoadConfig_DefaultStateFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.json")
 	configContent := `{
-		"lineUpID": "test",
-		"storageDir": "/tmp/rec"
-	}`
+				"lineUpID": "test",
+				"storageDir": "/tmp/rec"
+			}`
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(wd)
+	os.Chdir(tmpDir)   //nolint:errcheck
+	defer os.Chdir(wd) //nolint:errcheck
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -152,8 +152,8 @@ func TestLoadConfig_InvalidJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(wd)
+	os.Chdir(tmpDir)   //nolint:errcheck
+	defer os.Chdir(wd) //nolint:errcheck
 
 	_, err := LoadConfig()
 	if err == nil {
@@ -164,8 +164,8 @@ func TestLoadConfig_InvalidJSON(t *testing.T) {
 func TestLoadConfig_MissingFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(wd)
+	os.Chdir(tmpDir)   //nolint:errcheck
+	defer os.Chdir(wd) //nolint:errcheck
 
 	_, err := LoadConfig()
 	if err == nil {
@@ -173,7 +173,7 @@ func TestLoadConfig_MissingFile(t *testing.T) {
 	}
 }
 
-func assertString(t *testing.T, label, got, want string) {
+func assertString(t *testing.T, label string, got, want string) {
 	if got != want {
 		t.Fatalf("%s: expected %q, got %q", label, want, got)
 	}
