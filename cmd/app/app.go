@@ -447,13 +447,11 @@ func startRecordingScheduler() {
 		select {
 		case <-ticker.C:
 			now := time.Now().In(loc)
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			rows, err := db.QueryContext(ctx, `
+			rows, err := db.QueryContext(context.Background(), `
                 SELECT id, channel_id, date, start_time, duration, status, title
                 FROM recordings
-                WHERE status = 'pending'
-            `)
-			cancel()
+    			WHERE status = 'pending'
+    		`)
 			if err != nil {
 				log.Printf("Error loading recordings: %v", err)
 				continue
@@ -517,12 +515,7 @@ func startRecordingScheduler() {
 var recordingTimers sync.Map // key: recording ID, value: struct{}
 
 func dbQueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
-	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		cancel()
-	}
-	return rows, err
+	return db.QueryContext(ctx, query, args...)
 }
 
 func dbExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {

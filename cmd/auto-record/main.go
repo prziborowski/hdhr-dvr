@@ -224,7 +224,7 @@ func fetchJSONWithRetry[T any](baseURL, path string, maxRetries int) ([]T, error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(attempt*attempt) * time.Second
-			log.Printf("Retrying %s (attempt %d/%d) in %v...", url, attempt+1, maxRetries+1, backoff)
+			log.Printf("Retrying %s (attempt %d/%d) in %v... (%v)", url, attempt+1, maxRetries+1, backoff, lastErr)
 			time.Sleep(backoff)
 		}
 
@@ -235,9 +235,7 @@ func fetchJSONWithRetry[T any](baseURL, path string, maxRetries int) ([]T, error
 			continue
 		}
 
-		if err := resp.Body.Close(); err != nil {
-			log.Printf("Warning: error closing response body: %v", err)
-		}
+		defer resp.Body.Close() //nolint: errcheck
 
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("unexpected status code fetching %s: %d", url, resp.StatusCode)
