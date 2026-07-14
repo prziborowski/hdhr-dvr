@@ -259,7 +259,7 @@ func loadGuideData(apiBaseURL string) (*types.Guide, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetching guide data: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() // nolint: errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
@@ -407,7 +407,7 @@ func updateRecordingTitle(apiURL string, id int, title string) error {
 	if err != nil {
 		return fmt.Errorf("sending request to %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() // nolint: errcheck
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)

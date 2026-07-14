@@ -425,7 +425,9 @@ func loadRecordings() {
 	if err := rows.Err(); err != nil {
 		log.Printf("Error iterating recordings: %v", err)
 	}
-	rows.Close()
+	if err := rows.Close(); err != nil {
+		log.Printf("Error closing recordings cursor: %v", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		log.Printf("Error committing transaction: %v", err)
@@ -917,7 +919,7 @@ func getChannels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
+	defer rows.Close() // nolint: errcheck
 
 	type channelResponse struct {
 		GuideNumber string `json:"guideNumber"`
@@ -970,7 +972,7 @@ func getRecordings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
+	defer rows.Close() // nolint: errcheck
 
 	var recordings []GetRecordingsRec
 
@@ -1237,7 +1239,7 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
+	defer rows.Close() // nolint: errcheck
 
 	type event struct {
 		t    time.Time
@@ -1272,7 +1274,10 @@ func createRecording(w http.ResponseWriter, r *http.Request) {
 			if currentTuners >= tunerCount-1 {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusConflict)
-				json.NewEncoder(w).Encode(map[string]string{"error": "No tuners available during this time period"})
+				if err := json.NewEncoder(w).Encode(map[string]string{"error": "No tuners available during this time period"}); err != nil {
+					log.Printf("Error encoding tuner unavailable response: %v", err)
+					return
+				}
 				return
 			}
 		}
@@ -1375,7 +1380,7 @@ func getKeywords(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
+	defer rows.Close() // nolint: errcheck
 
 	var keywords []types.Keyword
 	for rows.Next() {
@@ -1573,7 +1578,7 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
 	channelMap := make(map[string]bool)
 	for rows.Next() {
@@ -1699,7 +1704,8 @@ func cleanupOldRecordings() {
 	if err := rows.Err(); err != nil {
 		log.Printf("Error iterating recordings for cleanup: %v", err)
 	}
-	rows.Close() // nolint: errcheck — close cursor before writing to avoid SQLite lock
+	rows.Close() //nolint:errcheck
+	// close cursor before writing to avoid SQLite lock
 
 	now := time.Now().In(loc)
 	updatedCount := 0
@@ -1749,7 +1755,7 @@ func fetchTunerCount() int {
 		log.Printf("Error fetching tuner count: %v, using default %d", err, defaultCount)
 		return defaultCount
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() // nolint: errcheck
 
 	var disc DiscoveryResponse
 	if err := json.NewDecoder(resp.Body).Decode(&disc); err != nil {

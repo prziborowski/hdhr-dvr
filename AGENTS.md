@@ -19,10 +19,14 @@ bin/build.sh        # Builds all binaries to bin/{app,guide,auto-record}
 
 Verify with:
 ```bash
-golangci-lint run ./...   # Should be clean (all 9 issues are pre-existing)
+bin/test.sh              # Run all pkg unit tests (required)
+golangci-lint fmt ./...  # Should not error
+golangci-lint run ./...  # Should be clean
 ```
 
-No Makefile. No test framework. The app expects `config.json` in the working directory.
+Tests are mandatory. Every code change must include relevant unit tests, and `bin/test.sh` must pass before considering a change complete. Add tests in `pkg/<package>/<package>_test.go` for each package.
+
+No Makefile. The app expects `config.json` in the working directory.
 
 ## config.json (single source of truth)
 

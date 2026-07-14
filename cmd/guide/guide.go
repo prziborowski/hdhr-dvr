@@ -29,7 +29,7 @@ func fetchTitanTVChannels(userId, lineupId string) ([]types.TitanTVChannel, erro
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("server returned non-OK status: %d", resp.StatusCode)
@@ -63,7 +63,7 @@ func fetchTitanTVScheduleBlock(userId, lineupId string, startTime time.Time) (*t
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("server returned non-OK status: %d", resp.StatusCode)
@@ -87,10 +87,10 @@ func fetchLocalChannels() ([]types.Channel, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() // nolint: errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("local channels API returned non-OK status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("server returned non-OK status: %d", resp.StatusCode)
 	}
 
 	var channels []types.Channel
@@ -230,11 +230,12 @@ func main() {
 						Duration: int(end.Sub(start).Minutes()),
 					}
 
-					if evt.ProgramType == "Movie" {
+					switch evt.ProgramType {
+					case "Movie":
 						prog.Category = "movie"
-					} else if evt.ProgramType == "Sports" {
+					case "Sports":
 						prog.Category = "sports"
-					} else if evt.ProgramType == "News" {
+					case "News":
 						prog.Category = "news"
 					}
 
