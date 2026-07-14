@@ -25,7 +25,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
-	defer db.Close()
+	defer db.Close() // nolint: errcheck
 
 	// Get all recordings
 	rows, err := db.Query("SELECT id, channel_id, date, start_time, duration, title FROM recordings")
@@ -34,7 +34,7 @@ func main() {
 	}
 
 	var records []struct {
-		r    types.Recording
+		r     types.Recording
 		title sql.NullString
 	}
 
@@ -47,11 +47,16 @@ func main() {
 			continue
 		}
 		records = append(records, struct {
-			r    types.Recording
+			r     types.Recording
 			title sql.NullString
 		}{r, title})
 	}
-	rows.Close() // Close rows before performing updates to avoid database lock
+	if err := rows.Err(); err != nil {
+		log.Printf("Error iterating recordings: %v", err)
+	}
+	if err := rows.Close(); err != nil { // nolint: errcheck
+		log.Printf("Error closing rows cursor: %v", err)
+	} // Close rows before performing updates to avoid database lock
 
 	count := 0
 	updated := 0

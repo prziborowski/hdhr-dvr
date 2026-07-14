@@ -1,6 +1,11 @@
-bin
+bin/*
+!bin/test.sh
+!bin/app.sh
+!bin/guide.sh
+!bin/auto-update.sh
 *.sw?
 recordings.db
 config.json
 guide*json
 .aider*
+.kilo
