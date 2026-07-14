@@ -36,9 +36,9 @@ type RecordingRequest struct {
 }
 
 const (
-	PreRollSeconds = 30
+	PreRollSeconds  = 30
 	PostRollMinutes = 1
-	queryTimeout   = 10 * time.Second
+	queryTimeout    = 10 * time.Second
 )
 
 var (
@@ -458,19 +458,19 @@ func startRecordingScheduler() {
 				log.Printf("Error loading recordings: %v", err)
 				continue
 			}
-		var recordings []types.Recording
-		for rows.Next() {
-			var r types.Recording
-			if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status, &r.Title); err != nil {
-				log.Printf("Error scanning recording: %v", err)
-				continue
+			var recordings []types.Recording
+			for rows.Next() {
+				var r types.Recording
+				if err := rows.Scan(&r.ID, &r.ChannelID, &r.Date, &r.StartTime, &r.Duration, &r.Status, &r.Title); err != nil {
+					log.Printf("Error scanning recording: %v", err)
+					continue
+				}
+				recordings = append(recordings, r)
 			}
-			recordings = append(recordings, r)
-		}
-		if err := rows.Err(); err != nil {
-			log.Printf("Error iterating recordings: %v", err)
-		}
-		rows.Close() //nolint: errcheck
+			if err := rows.Err(); err != nil {
+				log.Printf("Error iterating recordings: %v", err)
+			}
+			rows.Close() //nolint: errcheck
 
 			// Start a precise timer for each recording
 			for _, r := range recordings {
@@ -485,26 +485,26 @@ func startRecordingScheduler() {
 					continue
 				}
 
-			// Calculate the actual start time (30 seconds before scheduled time)
-			actualStartTime := startTime.Add(-PreRollSeconds * time.Second)
+				// Calculate the actual start time (30 seconds before scheduled time)
+				actualStartTime := startTime.Add(-PreRollSeconds * time.Second)
 
 				// Only schedule if the recording hasn't already started
 				if now.Before(actualStartTime) {
 					// Start a precise timer for this recording
 					go startRecordingTimer(r, actualStartTime)
-				} else if now.Before(startTime.Add(time.Duration(r.Duration+PostRollMinutes)*time.Minute)) {
+				} else if now.Before(startTime.Add(time.Duration(r.Duration+PostRollMinutes) * time.Minute)) {
 					// Recording should have started already, start it immediately
 					log.Printf("Recording %d should have started at %v, starting now", r.ID, actualStartTime)
 					go startRecording(r)
-			} else {
-				// Recording time has passed, mark as failed
-				log.Printf("Recording %d should have started at %v but it's now %v, marking as failed",
-					r.ID, actualStartTime, now)
-				_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
-				if err != nil {
-					log.Printf("Error updating recording status: %v", err)
+				} else {
+					// Recording time has passed, mark as failed
+					log.Printf("Recording %d should have started at %v but it's now %v, marking as failed",
+						r.ID, actualStartTime, now)
+					_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
+					if err != nil {
+						log.Printf("Error updating recording status: %v", err)
+					}
 				}
-			}
 			}
 		case <-recordingCh:
 			// Recording was already stored in database in createRecording
@@ -518,19 +518,18 @@ var recordingTimers sync.Map // key: recording ID, value: struct{}
 
 func dbQueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
-	defer cancel()
-	return db.QueryContext(ctx, query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		cancel()
+	}
+	return rows, err
 }
 
 func dbExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
-	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
-	defer cancel()
 	return db.ExecContext(ctx, query, args...)
 }
 
 func dbQueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
-	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
-	defer cancel()
 	return db.QueryRowContext(ctx, query, args...)
 }
 
@@ -827,16 +826,16 @@ func startRecording(r types.Recording) {
 		// Optional: remove original TS file after successful conversion
 		_ = os.Remove(outputFile)
 
-	// Get final file size and update database
-	if info, err := os.Stat(mp4File); err == nil {
-		size := info.Size()
-		_, err := dbExecContext(context.Background(), "UPDATE recordings SET file_size = ? WHERE id = ?", size, r.ID)
-		if err != nil {
-			log.Printf("Error updating recording file size: %v", err)
+		// Get final file size and update database
+		if info, err := os.Stat(mp4File); err == nil {
+			size := info.Size()
+			_, err := dbExecContext(context.Background(), "UPDATE recordings SET file_size = ? WHERE id = ?", size, r.ID)
+			if err != nil {
+				log.Printf("Error updating recording file size: %v", err)
+			}
+		} else {
+			log.Printf("Error getting final recording file size: %v", err)
 		}
-	} else {
-		log.Printf("Error getting final recording file size: %v", err)
-	}
 	}
 
 	// Final log message
@@ -1523,7 +1522,11 @@ func loadGuide() bool {
 	guideData = newGuideData
 	guideDataMutex.Unlock()
 
-	log.Println("Loaded guide data")
+	programs, ok := guideData["programs"].([]interface{})
+	if ok {
+		log.Printf("Loaded guide data: %d entries", len(programs))
+	}
+
 	return true
 }
 
@@ -1642,28 +1645,28 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	newGuideData := make(map[string]interface{})
+	newGuideData["programs"] = filteredPrograms
+	newGuideData["channels"] = guideData["channels"]
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(filteredPrograms); err != nil {
+	if err := json.NewEncoder(w).Encode(newGuideData); err != nil {
 		log.Printf("Error encoding guide response: %v", err)
 	}
 }
 
 func cleanupOldRecordings() {
 	log.Println("Cleaning up old recordings")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
 	loc, err := getLocalLocation()
 	if err != nil {
 		log.Printf("Error determining timezone: %v", err)
 		loc = time.UTC
 	}
 
-	rows, err := dbQueryContext(ctx, `
+	rows, err := dbQueryContext(context.Background(), `
         SELECT id, date, start_time, duration
         FROM recordings
         WHERE status IN ('pending', 'recording')
-    `)
+			`)
 	if err != nil {
 		log.Printf("Error loading recordings for cleanup: %v", err)
 		return

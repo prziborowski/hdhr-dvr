@@ -64,7 +64,7 @@ func (r *Recording) GetFilePath() string {
 }
 
 const (
-	PreRollSeconds = 30
+	PreRollSeconds  = 30
 	PostRollMinutes = 1
 )
 

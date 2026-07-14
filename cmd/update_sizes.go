@@ -34,7 +34,7 @@ func main() {
 	}
 
 	var records []struct {
-		r    types.Recording
+		r     types.Recording
 		title sql.NullString
 	}
 
@@ -47,7 +47,7 @@ func main() {
 			continue
 		}
 		records = append(records, struct {
-			r    types.Recording
+			r     types.Recording
 			title sql.NullString
 		}{r, title})
 	}
