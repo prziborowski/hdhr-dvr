@@ -36,9 +36,10 @@ type RecordingRequest struct {
 }
 
 const (
-	PreRollSeconds  = 30
-	PostRollMinutes = 1
-	queryTimeout    = 10 * time.Second
+	PreRollSeconds   = 30
+	PostRollMinutes  = 1
+	hdhomerunBaseURL = "http://hdhomerun.local"
+	queryTimeout     = 10 * time.Second
 )
 
 var (
@@ -46,13 +47,15 @@ var (
 	recordingCh    = make(chan types.Recording, 100)
 	config         *pkgcfg.Config
 	tunerCount     int
-	guideData      map[string]interface{}
+	guideData      types.Guide
 	guideDataMutex sync.RWMutex
 	watcher        *fsnotify.Watcher
 	// Track running ffmpeg processes
 	runningProcesses   sync.Map // key: recording ID, value: *exec.Cmd
 	shutdownInProgress bool
 	shutdownMutex      sync.Mutex
+	enabledChannels    map[string]bool
+	enabledChannelsMutex sync.RWMutex
 )
 
 func initDB() (*sql.DB, error) {
@@ -94,6 +97,7 @@ func main() {
 
 	// Create tables if they don't exist
 	createTables()
+	loadEnabledChannels()
 
 	// Load channels from HDHomeRun
 	loadChannels()
@@ -260,6 +264,32 @@ func updateRecording(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func loadEnabledChannels() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := dbQueryContext(ctx, "SELECT guide_number FROM channels WHERE enabled=1")
+	if err != nil {
+		log.Printf("Error loading enabled channels: %v", err)
+		return
+	}
+	defer rows.Close() //nolint:errcheck
+
+	newEnabledChannels := make(map[string]bool)
+	for rows.Next() {
+		var chNum string
+		if err := rows.Scan(&chNum); err != nil {
+			log.Printf("Error scanning enabled channel number: %v", err)
+			continue
+		}
+		newEnabledChannels[chNum] = true
+	}
+
+	enabledChannelsMutex.Lock()
+	enabledChannels = newEnabledChannels
+	enabledChannelsMutex.Unlock()
+}
+
 func createTables() {
 	_, err := db.Exec(`
         CREATE TABLE IF NOT EXISTS channels (
@@ -353,6 +383,7 @@ func loadChannels() {
 		log.Printf("Error committing channels transaction: %v", err)
 		tx.Rollback() //nolint: errcheck
 	}
+	loadEnabledChannels()
 }
 
 func loadRecordings() {
@@ -500,10 +531,7 @@ func startRecordingScheduler() {
 					// Recording time has passed, mark as failed
 					log.Printf("Recording %d should have started at %v but it's now %v, marking as failed",
 						r.ID, actualStartTime, now)
-					_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
-					if err != nil {
-						log.Printf("Error updating recording status: %v", err)
-					}
+					markFailed(r.ID)
 				}
 			}
 		case <-recordingCh:
@@ -526,6 +554,15 @@ func dbExecContext(ctx context.Context, query string, args ...interface{}) (sql.
 
 func dbQueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	return db.QueryRowContext(ctx, query, args...)
+}
+
+// markFailed updates the status of a recording to 'failed'.
+func markFailed(id int) {
+	log.Printf("Marking recording %d as failed", id)
+	_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", id)
+	if err != nil {
+		log.Printf("Error updating recording status to failed: %v", err)
+	}
 }
 
 // startRecordingTimer starts a precise timer for a recording
@@ -572,11 +609,7 @@ func startRecording(r types.Recording) {
 	cancel()
 	if err != nil {
 		log.Printf("Error finding channel %s: %v", r.ChannelID, err)
-		// Mark as failed in a separate transaction
-		_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
-		if err != nil {
-			log.Printf("Error updating recording status: %v", err)
-		}
+		markFailed(r.ID)
 		return
 	}
 
@@ -592,10 +625,7 @@ func startRecording(r types.Recording) {
 	startTime, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
 	if err != nil {
 		log.Printf("Error parsing start time: %v", err)
-		_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
-		if err != nil {
-			log.Printf("Error updating recording status: %v", err)
-		}
+		markFailed(r.ID)
 		return
 	}
 
@@ -608,11 +638,7 @@ func startRecording(r types.Recording) {
 	// Create output directory if it doesn't exist
 	if err := os.MkdirAll(config.StorageDir, 0755); err != nil {
 		log.Printf("Error creating output directory: %v", err)
-		// Mark as failed in a separate transaction
-		_, err := dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
-		if err != nil {
-			log.Printf("Error updating recording status: %v", err)
-		}
+		markFailed(r.ID)
 		return
 	}
 
@@ -1489,7 +1515,11 @@ func deleteKeyword(w http.ResponseWriter, r *http.Request) {
 }
 
 func getLocalLocation() (*time.Location, error) {
-	loc, err := time.LoadLocation("America/Los_Angeles")
+	tz := "America/Los_Angeles"
+	if config != nil && config.Timezone != "" {
+		tz = config.Timezone
+	}
+	loc, err := time.LoadLocation(tz)
 	if err != nil {
 		return time.UTC, nil
 	}
@@ -1510,7 +1540,7 @@ func loadGuide() bool {
 	}
 	defer file.Close() //nolint: errcheck
 
-	var newGuideData map[string]interface{}
+	var newGuideData types.Guide
 	if err := json.NewDecoder(file).Decode(&newGuideData); err != nil {
 		log.Printf("Error decoding guide.json: %v", err)
 		return false
@@ -1520,11 +1550,7 @@ func loadGuide() bool {
 	guideData = newGuideData
 	guideDataMutex.Unlock()
 
-	programs, ok := guideData["programs"].([]interface{})
-	if ok {
-		log.Printf("Loaded guide data: %d entries", len(programs))
-	}
-
+	log.Printf("Loaded guide data: %d programs", len(newGuideData.Programs))
 	return true
 }
 
@@ -1571,83 +1597,53 @@ func getGuide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-	rows, err := dbQueryContext(ctx, "SELECT guide_number FROM channels WHERE enabled=1")
-	if err != nil {
-		log.Printf("Error fetching valid channels: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close() //nolint:errcheck
-
+	enabledChannelsMutex.RLock()
 	channelMap := make(map[string]bool)
-	for rows.Next() {
-		var chNum string
-		if err := rows.Scan(&chNum); err != nil {
-			log.Printf("Error scanning channel number: %v", err)
-			continue
-		}
-		channelMap[chNum] = true
+	for k, v := range enabledChannels {
+		channelMap[k] = v
 	}
-	if err := rows.Err(); err != nil {
-		log.Printf("Error iterating channels for guide: %v", err)
-	}
+	enabledChannelsMutex.RUnlock()
 
-	var filteredPrograms []map[string]interface{}
+	now := time.Now()
 
 	guideDataMutex.RLock()
-	programs, ok := guideData["programs"].([]interface{})
+	programs := make([]types.Program, len(guideData.Programs))
+	copy(programs, guideData.Programs)
+	channels := make([]types.LineupData, len(guideData.Channels))
+	copy(channels, guideData.Channels)
 	guideDataMutex.RUnlock()
 
-	if ok {
-		now := time.Now()
-		for _, progInterface := range programs {
-			progMap, ok := progInterface.(map[string]interface{})
-			if !ok {
-				continue
-			}
-
-			channelNum, ok := progMap["channel"].(string)
-			if !ok || !channelMap[channelNum] {
-				continue
-			}
-
-			endTimeStr, endOk := progMap["end"].(string)
-			if !endOk {
-				continue
-			}
-
-			endTime, err := time.Parse(time.RFC3339, endTimeStr)
-			if err != nil {
-				log.Printf("Error parsing end time: %v", err)
-				continue
-			}
-
-			if endTime.Before(now) {
-				continue
-			}
-
-			filteredPrograms = append(filteredPrograms, progMap)
+	var filteredPrograms []types.Program
+	for _, prog := range programs {
+		if !channelMap[prog.Channel] {
+			continue
 		}
-
-		sort.Slice(filteredPrograms, func(i, j int) bool {
-			startI := filteredPrograms[i]["start"].(string)
-			startJ := filteredPrograms[j]["start"].(string)
-			channelI := filteredPrograms[i]["channel"].(string)
-			channelJ := filteredPrograms[j]["channel"].(string)
-
-			if startI != startJ {
-				return startI < startJ
-			}
-			return channelI < channelJ
-		})
+		endTime, err := time.Parse(time.RFC3339, prog.End)
+		if err != nil {
+			log.Printf("Error parsing end time for program %q: %v", prog.Title, err)
+			continue
+		}
+		if endTime.Before(now) {
+			continue
+		}
+		filteredPrograms = append(filteredPrograms, prog)
 	}
 
-	newGuideData := make(map[string]interface{})
-	newGuideData["programs"] = filteredPrograms
-	newGuideData["channels"] = guideData["channels"]
+	sort.SliceStable(filteredPrograms, func(i, j int) bool {
+		if filteredPrograms[i].Start == filteredPrograms[j].Start {
+			return filteredPrograms[i].Channel < filteredPrograms[j].Channel
+		}
+		return filteredPrograms[i].Start < filteredPrograms[j].Start
+	})
+
+	resp := types.Guide{
+		Channels:  channels,
+		Programs:  filteredPrograms,
+		Generated: guideData.Generated,
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(newGuideData); err != nil {
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("Error encoding guide response: %v", err)
 	}
 }
