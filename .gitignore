@@ -1,6 +1,7 @@
 bin/*
 !bin/test.sh
 !bin/app.sh
+!bin/build.sh
 !bin/guide.sh
 !bin/auto-update.sh
 *.sw?

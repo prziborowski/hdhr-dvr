@@ -9,7 +9,7 @@ A simple web-based DVR application for HDHomeRun tuners that allows you to sched
 - Download completed recordings
 - HTTP Range support for streaming recordings to VLC and other media players
 - SQLite database for storing recording schedules
-- Configurable storage directory via environment variable
+- Configurable storage directory via `config.json`
 
 ## Installation
 
@@ -24,26 +24,59 @@ A simple web-based DVR application for HDHomeRun tuners that allows you to sched
 ```bash
 git clone https://github.com/prziborowski/hdhr-dvr.git
 cd hdhr-dvr
-go build
+bin/build.sh
 ```
+
+This builds three binaries: `bin/app`, `bin/guide`, `bin/auto-record`.
 
 ### Running
 
-# Basic usage (uses default storage directory)
-./hdhr-dvr
+Start the DVR app:
 
-# With custom storage directory
-STORAGE_DIR=/your/custom/path ./hdhr-dvr
+```bash
+bin/app    # Starts web UI on http://localhost:8080
+```
+
+Fetch EPG guide data from TitanTV:
+
+```bash
+bin/guide   # Fetches channel guide, writes guide.json
+```
+
+Auto-schedule recordings by keyword:
+
+```bash
+bin/auto-record   # Matches keywords against guide and schedules recordings
+```
 
 ## Configuration
 
-### Environment Variables
+Copy `example.json` to `config.json` as a starting point:
 
-* STORAGE_DIR: Directory where recordings will be stored (default: /data/Storage/record)
+```bash
+cp example.json config.json
+```
+
+Edit the fields in `config.json`:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `timezone` | No | Go timezone (e.g., `America/Los_Angeles`). Defaults to `America/Los_Angeles`. |
+| `lineUpID` | Yes | Your TitanTV lineup ID. Obtain from your TitanTV account. |
+| `userId` | Yes | Your TitanTV user ID. Obtain from your TitanTV account. |
+| `days` | Yes | Number of EPG days to fetch (max 8). |
+| `guideFile` | No | Path for EPG output file. Defaults to `guide.json`. |
+| `stateFile` | No | Path for TitanTV state file. Defaults to `guide_state.json`. |
+| `storageDir` | Yes | Directory where recorded files are saved. |
+To obtain `lineUpID` and `userId`:
+
+1. Create a TitanTV account at [titantv.com](https://www.titantv.com)
+2. Set up your lineup to scan for local channels
+3. Inspect browser cookies/API requests from the TitanTV web interface to extract these values
 
 ### Database
 
-The application uses SQLite for storing recording schedules. The database file (recordings.db) will be created automatically in the application directory.
+The application uses SQLite at `./recordings.db`. The database is created automatically on first run.
 
 ### Usage
 
@@ -61,12 +94,12 @@ The application uses SQLite for storing recording schedules. The database file (
 
 * `GET /api/channels` - List available channels
 * `POST /api/recordings` - Create a new recording
-```
+```json
 {
-  "channelId": "12345",
-  "date": "2026-01-01",
-  "startTime": "19:00",
-  "duration": 60
+   "channelId": "12345",
+   "date": "2026-01-01",
+   "startTime": "19:00",
+   "duration": 60
 }
 ```
 * `DELETE /api/recordings/{id}` - Delete a recording
@@ -74,14 +107,29 @@ The application uses SQLite for storing recording schedules. The database file (
 
 ## Development
 
-### Running in Development
+### Building
+
+All three binaries are built together:
+
+```bash
+bin/build.sh          # Produces bin/app, bin/guide, bin/auto-record
 ```
-go run app.go
+
+Individual compilation:
+
+```bash
+go build -o bin/app cmd/app/app.go
+go build -o bin/guide cmd/guide/guide.go
+go build -o bin/auto-record cmd/auto-record/main.go
+```
+
+### Running in Development
+
+```bash
+bin/app    # Starts web UI on http://localhost:8080
 ```
 
 ## License
 
 MIT
-
-
 

@@ -30,8 +30,7 @@ No Makefile. The app expects `config.json` in the working directory.
 
 ## config.json (single source of truth)
 
-Fields: `timezone`, `lineUpID`, `days`, `guideFile`, `stateFile`, `storageDir`, `userId`, `cfClearanceCookie`
-No environment variables are used despite README mentioning `STORAGE_DIR`.
+Fields: `timezone`, `lineUpID`, `days`, `guideFile`, `stateFile`, `storageDir`, `userId`
 
 ## Architecture notes
 

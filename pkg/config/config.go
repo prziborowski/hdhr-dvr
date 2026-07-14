@@ -7,14 +7,13 @@ import (
 )
 
 type Config struct {
-	Timezone          string `json:"timezone"`
-	UserID            string `json:"userId"`
-	LineUpID          string `json:"lineUpID"`
-	Days              int    `json:"days"`
-	GuideFile         string `json:"guideFile"`
-	StateFile         string `json:"stateFile"`
-	StorageDir        string `json:"storageDir"`
-	CfClearanceCookie string `json:"cfClearanceCookie"`
+	Timezone   string `json:"timezone"`
+	UserID     string `json:"userId"`
+	LineUpID   string `json:"lineUpID"`
+	Days       int    `json:"days"`
+	GuideFile  string `json:"guideFile"`
+	StateFile  string `json:"stateFile"`
+	StorageDir string `json:"storageDir"`
 }
 
 // LoadConfig reads the configuration from config.json
