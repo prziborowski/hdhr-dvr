@@ -433,11 +433,14 @@ func (a *App) getRecordingFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filePath := filepath.Join(a.config.StorageDir, recording.GetFilePath())
+	// After conversion completes, the original .ts is deleted and only .mp4 remains.
+	// Build the file path with .mp4 extension to match what's actually on disk.
+	originalPath := filepath.Join(a.config.StorageDir, recording.GetFilePath())
+	outputFile := strings.TrimSuffix(originalPath, filepath.Ext(originalPath)) + ".mp4"
 
 	// Serve the file using http.ServeContent which handles Range requests,
 	// Content-Type detection, and Content-Length automatically.
-	http.ServeFile(w, r, filePath)
+	http.ServeFile(w, r, outputFile)
 }
 
 // ---------------------------------------------------------------------------
