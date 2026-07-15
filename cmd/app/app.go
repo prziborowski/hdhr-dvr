@@ -45,15 +45,17 @@ const (
 var recordingCh = make(chan types.Recording, 100)
 
 // App holds all dependencies for the HDHomeRun DVR application.
+// App holds all dependencies for the HDHomeRun DVR application.
 type App struct {
-	db                   *sql.DB
-	config               *pkgcfg.Config
-	tunerCount           int
-	guideData            types.Guide
-	guideDataMutex       sync.RWMutex
-	watcher              *fsnotify.Watcher
-	runningProcesses     sync.Map // key: recording ID, value: *exec.Cmd
-	enabledChannels      map[string]bool
+	store               types.Store
+	sqlDB               *sql.DB
+	config                *pkgcfg.Config
+	tunerCount          int
+	guideData           types.Guide
+	guideDataMutex      sync.RWMutex
+	watcher               *fsnotify.Watcher
+	runningProcesses    sync.Map // key: recording ID, value: *exec.Cmd
+	enabledChannels     map[string]bool
 	enabledChannelsMutex sync.RWMutex
 }
 
@@ -64,15 +66,16 @@ func main() {
 
 	// Initialize database
 	var err error
-	app.db, err = sql.Open("sqlite3", "./recordings.db")
+	app.sqlDB, err = sql.Open("sqlite3", "./recordings.db")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer app.db.Close() //nolint: errcheck
+	defer app.sqlDB.Close() //nolint: errcheck
 
-	app.db.SetMaxOpenConns(10)
-	app.db.SetMaxIdleConns(5)
-	app.db.SetConnMaxLifetime(0)
+	app.store = types.NewStoreAdapter(app.sqlDB)
+	app.sqlDB.SetMaxOpenConns(10)
+	app.sqlDB.SetMaxIdleConns(5)
+	app.sqlDB.SetConnMaxLifetime(0)
 
 	// Load configuration
 	app.config, err = pkgcfg.LoadConfig()
@@ -287,7 +290,7 @@ func (a *App) createRecording(w http.ResponseWriter, r *http.Request) {
 
 	txCtx, txCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer txCancel()
-	tx, err := a.db.BeginTx(txCtx, nil)
+	tx, err := a.store.BeginTx(txCtx, nil)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -477,15 +480,15 @@ func (a *App) deleteRecording(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func (a *App) dbQueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
-	return a.db.QueryContext(ctx, query, args...)
+	return a.store.QueryContext(ctx, query, args...)
 }
 
 func (a *App) dbExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
-	return a.db.ExecContext(ctx, query, args...)
+	return a.store.ExecContext(ctx, query, args...)
 }
 
 func (a *App) dbQueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
-	return a.db.QueryRowContext(ctx, query, args...)
+	return a.store.QueryRowContext(ctx, query, args...)
 }
 
 func (a *App) markFailed(id int) {
@@ -514,7 +517,7 @@ func (a *App) getLocalLocation() (*time.Location, error) {
 // ---------------------------------------------------------------------------
 
 func (a *App) createTables() {
-	_, err := a.db.Exec(`
+	_, err := a.store.ExecContext(context.Background(), `
         CREATE TABLE IF NOT EXISTS channels (
             guide_number TEXT PRIMARY KEY,
             guide_name TEXT,
@@ -595,13 +598,13 @@ func (a *App) loadChannels() {
 		return
 	}
 
-	tx, err := a.db.Begin()
+	tx, err := a.store.BeginTx(context.Background(), nil)
 	if err != nil {
 		log.Printf("Error starting transaction for channels: %v", err)
 		return
 	}
 
-	_, err = tx.Exec("UPDATE channels SET enabled=0")
+	_, err = tx.ExecContext(context.Background(), "UPDATE channels SET enabled=0")
 	if err != nil {
 		log.Printf("Error clearing channels table: %v", err)
 		tx.Rollback() //nolint: errcheck
@@ -610,7 +613,7 @@ func (a *App) loadChannels() {
 
 	failedCount := 0
 	for _, ch := range chs {
-		_, err := tx.Exec("INSERT OR REPLACE INTO channels (guide_number, guide_name, url, enabled) VALUES (?, ?, ?, ?)",
+			_, err := tx.ExecContext(context.Background(), "INSERT OR REPLACE INTO channels (guide_number, guide_name, url, enabled) VALUES (?, ?, ?, ?)",
 			ch.GuideNumber, ch.GuideName, ch.URL, ch.Enabled == nil || *ch.Enabled == 1)
 		if err != nil {
 			log.Printf("Error storing channel %s: %v", ch.GuideNumber, err)
@@ -636,7 +639,7 @@ func (a *App) loadRecordings() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	tx, err := a.db.BeginTx(ctx, nil)
+	tx, err := a.store.BeginTx(ctx, nil)
 	if err != nil {
 		log.Printf("Error starting database transaction: %v", err)
 		return
@@ -677,7 +680,7 @@ func (a *App) loadRecordings() {
 			continue
 		}
 
-		newStatus := r.CheckStatus(a.db, loc, a.config.StorageDir)
+		newStatus := r.CheckStatus(a.store, loc, a.config.StorageDir)
 		if r.Status != newStatus {
 			_, err := tx.ExecContext(ctx, "UPDATE recordings SET status = ? WHERE id = ?", newStatus, r.ID)
 			if err != nil {
@@ -730,7 +733,7 @@ func (a *App) startRecordingScheduler() {
 		select {
 		case <-ticker.C:
 			now := time.Now().In(loc)
-			rows, err := a.db.QueryContext(context.Background(), `
+			rows, err := a.store.QueryContext(context.Background(), `
                 SELECT id, channel_id, date, start_time, duration, status, title
                 FROM recordings
       			WHERE status = 'pending'
@@ -965,7 +968,7 @@ func (a *App) updateStatusWithRetry(id int, status string) error {
 	for retryCount < maxRetries {
 		txCtx, txCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer txCancel()
-		tx, err := a.db.BeginTx(txCtx, nil)
+	tx, err := a.store.BeginTx(txCtx, nil)
 		if err != nil {
 			log.Printf("Error starting database transaction: %v", err)
 			retryCount++
@@ -1364,7 +1367,7 @@ func (a *App) createKeyword(w http.ResponseWriter, r *http.Request) {
 		enabled = *req.Enabled
 	}
 
-	result, err := a.db.Exec("INSERT INTO keywords (name, category, enabled) VALUES (?, ?, ?)", req.Name, req.Category, enabled)
+	result, err := a.store.ExecContext(context.Background(), "INSERT INTO keywords (name, category, enabled) VALUES (?, ?, ?)", req.Name, req.Category, enabled)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") || strings.Contains(err.Error(), "duplicate") {
 			w.Header().Set("Content-Type", "application/json")
@@ -1396,7 +1399,7 @@ func (a *App) deleteKeyword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := a.db.Exec("DELETE FROM keywords WHERE id = ?", id)
+	result, err := a.store.ExecContext(context.Background(), "DELETE FROM keywords WHERE id = ?", id)
 	if err != nil {
 		log.Printf("Error deleting keyword: %v", err)
 		http.Error(w, "Failed to delete keyword", http.StatusInternalServerError)

@@ -1,6 +1,7 @@
 package types
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -68,9 +69,24 @@ const (
 	PostRollMinutes = 1
 )
 
-func (r *Recording) CheckStatus(db *sql.DB, loc *time.Location, storageDir string) string {
+type Store interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (Tx, error)
+}
+
+type Tx interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+	Commit() error
+	Rollback() error
+}
+
+func (r *Recording) CheckStatus(store Store, loc *time.Location, storageDir string) string {
 	var channelName string
-	err := db.QueryRow("SELECT guide_name FROM channels WHERE guide_number = ?", r.ChannelID).Scan(&channelName)
+	err := store.QueryRowContext(context.Background(), "SELECT guide_name FROM channels WHERE guide_number = ?", r.ChannelID).Scan(&channelName)
 	if err != nil {
 		log.Printf("Error looking up channel %s for recording %d status: %v", r.ChannelID, r.ID, err)
 		return "failed"
@@ -190,6 +206,60 @@ type Keyword struct {
 	ID        int       `json:"id"`
 	Name      string    `json:"name"`
 	Category  string    `json:"category,omitempty"`
-	Enabled   bool      `json:"enabled"`
+	Enabled   bool       `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// StoreAdapter wraps *sql.DB to implement types.Store.
+type StoreAdapter struct {
+	db *sql.DB
+}
+
+func NewStoreAdapter(db *sql.DB) *StoreAdapter {
+	return &StoreAdapter{db: db}
+}
+
+func (s *StoreAdapter) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	return s.db.QueryContext(ctx, query, args...)
+}
+
+func (s *StoreAdapter) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	return s.db.ExecContext(ctx, query, args...)
+}
+
+func (s *StoreAdapter) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	return s.db.QueryRowContext(ctx, query, args...)
+}
+
+func (s *StoreAdapter) BeginTx(ctx context.Context, opts *sql.TxOptions) (Tx, error) {
+	tx, err := s.db.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &TxAdapter{tx: tx}, nil
+}
+
+// TxAdapter wraps *sql.Tx to implement types.Tx.
+type TxAdapter struct {
+	tx *sql.Tx
+}
+
+func (t *TxAdapter) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	return t.tx.QueryContext(ctx, query, args...)
+}
+
+func (t *TxAdapter) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	return t.tx.ExecContext(ctx, query, args...)
+}
+
+func (t *TxAdapter) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	return t.tx.QueryRowContext(ctx, query, args...)
+}
+
+func (t *TxAdapter) Commit() error {
+	return t.tx.Commit()
+}
+
+func (t *TxAdapter) Rollback() error {
+	return t.tx.Rollback()
 }
