@@ -23,12 +23,14 @@ import (
 // --- Mocks ---
 
 type MockCommander struct {
-	RunCommandFunc    func(name string, args ...string) error
-	StartCommandFunc  func(name string, args ...string, stdout, stderr io.Writer) (*exec.Cmd, error)
-	StatFunc          func(path string) (os.FileInfo, error)
-	MkdirAllFunc      func(path string, perm os.FileMode) error
-	RemoveFunc        func(path string) error
-	CreateFunc        func(path string) (*os.File, error)
+	RunCommandFunc   func(name string, args ...string) error
+	StartCommandFunc func(name string, stdout, stderr io.Writer, args ...string) (*exec.Cmd, error)
+	StatFunc         func(path string) (os.FileInfo, error)
+	MkdirAllFunc     func(path string, perm os.FileMode) error
+	RemoveFunc       func(path string) error
+	CreateFunc       func(path string) (*os.File, error)
+	OpenFunc         func(path string) (*os.File, error)
+	ReadFileFunc     func(path string) ([]byte, error)
 }
 
 func (m *MockCommander) RunCommand(name string, args ...string) error {
@@ -38,9 +40,9 @@ func (m *MockCommander) RunCommand(name string, args ...string) error {
 	return nil
 }
 
-func (m *MockCommander) StartCommand(name string, args ...string, stdout, stderr io.Writer) (*exec.Cmd, error) {
+func (m *MockCommander) StartCommand(name string, stdout, stderr io.Writer, args ...string) (*exec.Cmd, error) {
 	if m.StartCommandFunc != nil {
-		return m.StartCommandFunc(name, args..., stdout, stderr)
+		return m.StartCommandFunc(name, stdout, stderr, args...)
 	}
 	return &exec.Cmd{}, nil
 }
@@ -73,6 +75,20 @@ func (m *MockCommander) Create(path string) (*os.File, error) {
 	return nil, fmt.Errorf("cannot create file")
 }
 
+func (m *MockCommander) Open(path string) (*os.File, error) {
+	if m.OpenFunc != nil {
+		return m.OpenFunc(path)
+	}
+	return nil, fmt.Errorf("file not found")
+}
+
+func (m *MockCommander) ReadFile(path string) ([]byte, error) {
+	if m.ReadFileFunc != nil {
+		return m.ReadFileFunc(path)
+	}
+	return nil, fmt.Errorf("cannot read file")
+}
+
 // setupTestApp creates an App instance with an in-memory SQLite database.
 func setupTestApp(t *testing.T) (*App, *sql.DB) {
 	db, err := sql.Open("sqlite3", ":memory:")
@@ -100,11 +116,16 @@ func setupTestApp(t *testing.T) (*App, *sql.DB) {
 
 func TestIsTunerAvailable(t *testing.T) {
 	app, db := setupTestApp(t)
-	defer db.Close()
+	defer db.Close() //nolint: errcheck
 
 	// Setup: Insert some recordings to occupy tuners
-	// Recording 1: 2026-07-14 12:00 to 13:00
 	_, err := db.Exec("INSERT INTO recordings (channel_id, date, start_time, duration, status) VALUES (?, ?, ?, ?, ?)", "1", "2026-07-14", "12:00", 60, "pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Add second recording to fill tuners (tunerCount is 2)
+	_, err = db.Exec("INSERT INTO recordings (channel_id, date, start_time, duration, status) VALUES (?, ?, ?, ?, ?)", "2", "2026-07-14", "12:30", 60, "pending")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,45 +135,16 @@ func TestIsTunerAvailable(t *testing.T) {
 		req      RecordingRequest
 		expected bool
 	}{
-		{
-			name:     "Tuner Available (No overlap)",
-			req:      RecordingRequest{Date: "2026-07-14", StartTime: "13:01", Duration: 60},
-			expected: true,
-		},
-		{
-			name:     "Tuner Available (One overlap, total < tunerCount)",
-			req:      RecordingRequest{Date: "2026-07-14", StartTime: "12:30", Duration: 60},
-			expected: true,
-		},
-		{
-			name:     "Tuner Full (Two overlaps, total >= tunerCount)",
-			req:      RecordingRequest{Date: "2026-07-14", StartTime: "12:30", Duration: 60},
-			expected: true, // Wait, we only have 1 recording. Let's add another one.
-		},
-	}
-
-	// Add second recording to fill tuners (tunerCount is 2)
-	_, err = db.Exec("INSERT INTO recordings (channel_id, date, start_time, duration, status) VALUES (?, ?, ?, ?, ?)", "2", "2026-07-14", "12:30", 60, "pending")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Redefine tests for the new state
-	tests = []struct {
-		name     string
-		req      RecordingRequest
-		expected bool
-	}{
-		{
-			name:     "Tuner Available (No overlap)",
+			{
+			name:      "Tuner Available (No overlap)",
 			req:      RecordingRequest{Date: "2026-07-14", StartTime: "14:00", Duration: 60},
 			expected: true,
-		},
-		{
-			name:     "Tuner Full (Overlap with both recordings)",
+			},
+			{
+			name:      "Tuner Full (Overlap with both recordings)",
 			req:      RecordingRequest{Date: "2026-07-14", StartTime: "12:45", Duration: 30},
 			expected: false,
-		},
+			},
 	}
 
 	for _, tt := range tests {
@@ -170,7 +162,7 @@ func TestIsTunerAvailable(t *testing.T) {
 
 func TestCleanupOldRecordings(t *testing.T) {
 	app, db := setupTestApp(t)
-	defer db.Close()
+	defer db.Close() //nolint: errcheck
 
 	// Set timezone to UTC for predictable tests
 	app.config.Timezone = "UTC"
@@ -210,7 +202,7 @@ func TestCleanupOldRecordings(t *testing.T) {
 
 func TestMarkFailed(t *testing.T) {
 	app, db := setupTestApp(t)
-	defer db.Close()
+	defer db.Close() //nolint: errcheck
 
 	_, err := db.Exec("INSERT INTO recordings (id, channel_id, date, start_time, duration, status) VALUES (123, '1', '2026-07-14', '12:00', 60, 'pending')")
 	if err != nil {
@@ -228,7 +220,7 @@ func TestMarkFailed(t *testing.T) {
 
 func TestCreateRecordingHandler(t *testing.T) {
 	app, db := setupTestApp(t)
-	defer db.Close()
+	defer db.Close() //nolint: errcheck
 
 	// Setup channel
 	_, err := db.Exec("INSERT INTO channels (guide_number, guide_name, url, enabled) VALUES (?, ?, ?, ?)", "101", "Test Channel", "http://test", 1)
@@ -242,18 +234,18 @@ func TestCreateRecordingHandler(t *testing.T) {
 		expectedCode int
 	}{
 		{
-			name: "Success",
-			body: RecordingRequest{ChannelID: "101", Date: "2026-07-14", StartTime: "12:00", Duration: 30},
+			name:         "Success",
+			body:         RecordingRequest{ChannelID: "101", Date: "2026-07-14", StartTime: "12:00", Duration: 30},
 			expectedCode: http.StatusCreated,
 		},
 		{
-			name: "Invalid Duration",
-			body: RecordingRequest{ChannelID: "101", Date: "2026-07-14", StartTime: "12:00", Duration: -1},
+			name:         "Invalid Duration",
+			body:         RecordingRequest{ChannelID: "101", Date: "2026-07-14", StartTime: "12:00", Duration: -1},
 			expectedCode: http.StatusBadRequest,
 		},
 		{
-			name: "Channel Not Found",
-			body: RecordingRequest{ChannelID: "999", Date: "2026-07-14", StartTime: "12:00", Duration: 30},
+			name:         "Channel Not Found",
+			body:         RecordingRequest{ChannelID: "999", Date: "2026-07-14", StartTime: "12:00", Duration: 30},
 			expectedCode: http.StatusNotFound,
 		},
 	}
@@ -276,7 +268,7 @@ func TestCreateRecordingHandler(t *testing.T) {
 
 func TestUpdateRecordingHandler(t *testing.T) {
 	app, db := setupTestApp(t)
-	defer db.Close()
+	defer db.Close() //nolint: errcheck
 
 	_, err := db.Exec("INSERT INTO recordings (id, channel_id, date, start_time, duration, status) VALUES (123, '1', '2026-07-14', '12:00', 60, 'pending')")
 	if err != nil {
@@ -290,21 +282,21 @@ func TestUpdateRecordingHandler(t *testing.T) {
 		expectedCode int
 	}{
 		{
-			name: "Success",
-			id:   "123",
-			body: map[string]string{"title": "New Title"},
+			name:         "Success",
+			id:           "123",
+			body:         map[string]string{"title": "New Title"},
 			expectedCode: http.StatusNoContent,
 		},
 		{
-			name: "Not Found",
-			id:   "456",
-			body: map[string]string{"title": "New Title"},
+			name:         "Not Found",
+			id:           "456",
+			body:         map[string]string{"title": "New Title"},
 			expectedCode: http.StatusNotFound,
 		},
 		{
-			name: "Invalid ID",
-			id:   "abc",
-			body: map[string]string{"title": "New Title"},
+			name:         "Invalid ID",
+			id:           "abc",
+			body:         map[string]string{"title": "New Title"},
 			expectedCode: http.StatusBadRequest,
 		},
 	}
@@ -314,9 +306,7 @@ func TestUpdateRecordingHandler(t *testing.T) {
 			body, _ := json.Marshal(tt.body)
 			req := httptest.NewRequest("PATCH", "/api/recordings/"+tt.id, bytes.NewBuffer(body))
 			req.Header.Set("Content-Type", "application/json")
-			
-			// Gorilla Mux vars need to be set manually in tests
-			vr := mux.Vars(req) // this doesn't work with httptest without a router
+
 			// Instead, we use a real router for handler tests that depend on mux vars
 			r := mux.NewRouter()
 			r.HandleFunc("/api/recordings/{id}", app.updateRecording).Methods("PATCH")
@@ -332,7 +322,7 @@ func TestUpdateRecordingHandler(t *testing.T) {
 
 func TestDeleteRecordingHandler(t *testing.T) {
 	app, db := setupTestApp(t)
-	defer db.Close()
+	defer db.Close() //nolint: errcheck
 
 	_, err := db.Exec("INSERT INTO recordings (id, channel_id, date, start_time, duration, status) VALUES (123, '1', '2026-07-14', '12:00', 60, 'pending')")
 	if err != nil {
@@ -351,7 +341,9 @@ func TestDeleteRecordingHandler(t *testing.T) {
 	}
 
 	var count int
-	db.QueryRow("SELECT COUNT(*) FROM recordings WHERE id = 123").Scan(&count)
+	if err := db.QueryRow("SELECT COUNT(*) FROM recordings WHERE id = 123").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
 	if count != 0 {
 		t.Error("recording was not deleted from db")
 	}
@@ -359,7 +351,7 @@ func TestDeleteRecordingHandler(t *testing.T) {
 
 func TestGetRecordingsHandler(t *testing.T) {
 	app, db := setupTestApp(t)
-	defer db.Close()
+	defer db.Close() //nolint: errcheck
 
 	_, err := db.Exec("INSERT INTO channels (guide_number, guide_name) VALUES (?, ?)", "101", "Test Channel")
 	if err != nil {
@@ -390,7 +382,7 @@ func TestGetRecordingsHandler(t *testing.T) {
 
 func TestGetKeywordsHandler(t *testing.T) {
 	app, db := setupTestApp(t)
-	defer db.Close()
+	defer db.Close() //nolint: errcheck
 
 	_, err := db.Exec("INSERT INTO keywords (name, category, enabled) VALUES (?, ?, ?)", "test-word", "sports", 1)
 	if err != nil {
@@ -418,12 +410,12 @@ func TestGetKeywordsHandler(t *testing.T) {
 func TestConvertToMp4(t *testing.T) {
 	commander := &MockCommander{}
 	var capturedArgs []string
-	commander.StartCommandFunc = func(name string, args ...string, stdout, stderr io.Writer) (*exec.Cmd, error) {
+	commander.StartCommandFunc = func(name string, stdout, stderr io.Writer, args ...string) (*exec.Cmd, error) {
 		capturedArgs = args
 		return &exec.Cmd{}, nil
 	}
 
-	// Since we are mocking StartCommand to return a dummy *exec.Cmd, and that Cmd will fail on Wait(), 
+	// Since we are mocking StartCommand to return a dummy *exec.Cmd, and that Cmd will fail on Wait(),
 	// the function will try the slower conversion as well.
 	err := convertToMp4(commander, "input.ts", "output.mp4")
 	if err != nil {

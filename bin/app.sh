@@ -2,5 +2,5 @@
 
 cd "$(dirname "$0")"/..
 
-go build -o bin/app cmd/app/app.go
+go build -o bin/app ./cmd/app
 bin/app

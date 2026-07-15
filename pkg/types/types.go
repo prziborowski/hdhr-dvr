@@ -206,7 +206,7 @@ type Keyword struct {
 	ID        int       `json:"id"`
 	Name      string    `json:"name"`
 	Category  string    `json:"category,omitempty"`
-	Enabled   bool       `json:"enabled"`
+	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 }
 

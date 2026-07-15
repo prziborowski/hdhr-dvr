@@ -47,41 +47,51 @@ var recordingCh = make(chan types.Recording, 100)
 // App holds all dependencies for the HDHomeRun DVR application.
 // App holds all dependencies for the HDHomeRun DVR application.
 type App struct {
-	store               types.Store
-	sqlDB               *sql.DB
-	config                *pkgcfg.Config
-	tunerCount          int
-	guideData           types.Guide
-	guideDataMutex      sync.RWMutex
-	watcher               *fsnotify.Watcher
-	runningProcesses    sync.Map // key: recording ID, value: *exec.Cmd
-	enabledChannels     map[string]bool
+	store                types.Store
+	sqlDB                *sql.DB
+	config               *pkgcfg.Config
+	commander            Commander
+	tunerCount           int
+	guideData            types.Guide
+	guideDataMutex       sync.RWMutex
+	watcher              *fsnotify.Watcher
+	runningProcesses     sync.Map // key: recording ID, value: *exec.Cmd
+	enabledChannels      map[string]bool
 	enabledChannelsMutex sync.RWMutex
 }
 
-func main() {
-	app := &App{
+func NewApp(cfg *pkgcfg.Config, store types.Store, commander Commander) *App {
+	return &App{
+		config:          cfg,
+		store:           store,
+		commander:       commander,
 		enabledChannels: make(map[string]bool),
 	}
+}
 
+func main() {
 	// Initialize database
 	var err error
-	app.sqlDB, err = sql.Open("sqlite3", "./recordings.db")
+	db, err := sql.Open("sqlite3", "./recordings.db")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer app.sqlDB.Close() //nolint: errcheck
+	defer db.Close() //nolint: errcheck
 
-	app.store = types.NewStoreAdapter(app.sqlDB)
-	app.sqlDB.SetMaxOpenConns(10)
-	app.sqlDB.SetMaxIdleConns(5)
-	app.sqlDB.SetConnMaxLifetime(0)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(0)
 
 	// Load configuration
-	app.config, err = pkgcfg.LoadConfig()
+	cfg, err := pkgcfg.LoadConfig()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	store := types.NewStoreAdapter(db)
+	commander := &RealCommander{}
+	app := NewApp(cfg, store, commander)
+	app.sqlDB = db
 
 	app.tunerCount = app.fetchTunerCount()
 	log.Printf("System initialized with %d tuners", app.tunerCount)
@@ -613,7 +623,7 @@ func (a *App) loadChannels() {
 
 	failedCount := 0
 	for _, ch := range chs {
-			_, err := tx.ExecContext(context.Background(), "INSERT OR REPLACE INTO channels (guide_number, guide_name, url, enabled) VALUES (?, ?, ?, ?)",
+		_, err := tx.ExecContext(context.Background(), "INSERT OR REPLACE INTO channels (guide_number, guide_name, url, enabled) VALUES (?, ?, ?, ?)",
 			ch.GuideNumber, ch.GuideName, ch.URL, ch.Enabled == nil || *ch.Enabled == 1)
 		if err != nil {
 			log.Printf("Error storing channel %s: %v", ch.GuideNumber, err)
@@ -796,9 +806,9 @@ func (a *App) startRecordingTimer(recording types.Recording, startTime time.Time
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	var exists bool
 	err := a.dbQueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recordings WHERE id = ? AND status = 'pending')", recording.ID).Scan(&exists)
-	cancel()
 	if err != nil {
 		log.Printf("Error checking if recording %d exists: %v", recording.ID, err)
 		return
@@ -845,7 +855,7 @@ func (a *App) startRecording(r types.Recording) {
 	log.Printf("Original start time: %v, Adjusted start time: %v, Original duration: %d, Adjusted duration: %d",
 		startTime, adjustedStartTime, r.Duration, adjustedDuration)
 
-	if err := os.MkdirAll(a.config.StorageDir, 0755); err != nil {
+	if err := a.commander.MkdirAll(a.config.StorageDir, 0755); err != nil {
 		log.Printf("Error creating output directory: %v", err)
 		a.markFailed(r.ID)
 		return
@@ -853,7 +863,7 @@ func (a *App) startRecording(r types.Recording) {
 
 	outputFile := filepath.Join(a.config.StorageDir, r.GetFilePath())
 	logFile := filepath.Join("/tmp", fmt.Sprintf("ffmpeg-%s-%s.log", r.Date, r.StartTime))
-	logFileHandle, err := os.Create(logFile)
+	logFileHandle, err := a.commander.Create(logFile)
 	if err != nil {
 		log.Printf("Error creating log file: %v", err)
 		_, updateErr := a.dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
@@ -866,7 +876,12 @@ func (a *App) startRecording(r types.Recording) {
 
 	durationSeconds := adjustedDuration * 60
 	ffmpegArgs := buildFFmpegArgs(ch.URL, durationSeconds, outputFile)
-	cmd := exec.Command("ffmpeg", ffmpegArgs...)
+	cmd, err := a.commander.StartCommand("ffmpeg", logFileHandle, logFileHandle, ffmpegArgs...)
+	if err != nil {
+		log.Printf("Error starting ffmpeg: %v", err)
+		a.markFailed(r.ID)
+		return
+	}
 
 	log.Printf("Starting recording: %s", outputFile)
 	log.Printf("Channel: %s (%s)", ch.GuideName, ch.GuideNumber)
@@ -875,9 +890,6 @@ func (a *App) startRecording(r types.Recording) {
 	log.Printf("Storage directory: %s", a.config.StorageDir)
 	log.Printf("Log file: %s", logFile)
 	log.Printf("FFmpeg command: %s", getFFmpegCommandString(ch.URL, durationSeconds, outputFile))
-
-	cmd.Stdout = logFileHandle
-	cmd.Stderr = logFileHandle
 
 	if err := a.updateStatusWithRetry(r.ID, "recording"); err != nil {
 		logFileHandle.Close() //nolint: errcheck
@@ -900,15 +912,18 @@ func (a *App) startRecording(r types.Recording) {
 
 		log.Printf("Error running ffmpeg (attempt %d/%d): %v", retryCount+1, maxRetries+1, runErr)
 
-		if isHttpServerError(logFile) && retryCount < maxRetries {
+		if isHttpServerError(a, logFile) && retryCount < maxRetries {
 			wait := backoff[retryCount]
 			log.Printf("Detected HTTP server error, retrying in %v...", wait)
 			time.Sleep(wait)
 
 			ffmpegArgs := buildFFmpegArgs(ch.URL, durationSeconds, outputFile)
-			cmd = exec.Command("ffmpeg", ffmpegArgs...)
-			cmd.Stdout = logFileHandle
-			cmd.Stderr = logFileHandle
+			cmd, err = a.commander.StartCommand("ffmpeg", logFileHandle, logFileHandle, ffmpegArgs...)
+			if err != nil {
+				log.Printf("Error restarting ffmpeg: %v", err)
+				a.markFailed(r.ID)
+				return
+			}
 			a.runningProcesses.Store(r.ID, cmd)
 
 			retryCount++
@@ -919,7 +934,7 @@ func (a *App) startRecording(r types.Recording) {
 
 	if runErr != nil {
 		log.Printf("Error running ffmpeg after retries: %v", runErr)
-		if _, err := os.Stat(outputFile); err == nil {
+		if _, err := a.commander.Stat(outputFile); err == nil {
 			a.updateStatusWithRetry(r.ID, "completed") //nolint:errcheck
 		} else {
 			a.markFailed(r.ID)
@@ -932,11 +947,11 @@ func (a *App) startRecording(r types.Recording) {
 	}
 
 	mp4File := strings.TrimSuffix(outputFile, filepath.Ext(outputFile)) + ".mp4"
-	if err := convertToMp4(outputFile, mp4File); err != nil {
+	if err := convertToMp4(a.commander, outputFile, mp4File); err != nil {
 		log.Printf("Conversion warning: %v", err)
 	} else {
-		_ = os.Remove(outputFile)
-		if info, err := os.Stat(mp4File); err == nil {
+		_ = a.commander.Remove(outputFile)
+		if info, err := a.commander.Stat(mp4File); err == nil {
 			size := info.Size()
 			_, updateErr := a.dbExecContext(context.Background(), "UPDATE recordings SET file_size = ? WHERE id = ?", size, r.ID)
 			if updateErr != nil {
@@ -951,6 +966,7 @@ func (a *App) startRecording(r types.Recording) {
 }
 
 // getChannelInfo validates the channel exists and returns its details.
+
 func (a *App) getChannelInfo(channelID string) (types.Channel, error) {
 	var ch types.Channel
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -968,7 +984,7 @@ func (a *App) updateStatusWithRetry(id int, status string) error {
 	for retryCount < maxRetries {
 		txCtx, txCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer txCancel()
-	tx, err := a.store.BeginTx(txCtx, nil)
+		tx, err := a.store.BeginTx(txCtx, nil)
 		if err != nil {
 			log.Printf("Error starting database transaction: %v", err)
 			retryCount++
@@ -1014,12 +1030,12 @@ func (a *App) updateStatusWithRetry(id int, status string) error {
 // ---------------------------------------------------------------------------
 
 func (a *App) loadGuide() bool {
-	if _, err := os.Stat(a.config.GuideFile); os.IsNotExist(err) {
+	if _, err := a.commander.Stat(a.config.GuideFile); err != nil && os.IsNotExist(err) {
 		log.Println("No guide.json found, skipping")
 		return false
 	}
 
-	file, err := os.Open(a.config.GuideFile)
+	file, err := a.commander.Open(a.config.GuideFile)
 	if err != nil {
 		log.Printf("Error opening guide.json: %v", err)
 		return false
@@ -1419,7 +1435,7 @@ func (a *App) deleteKeyword(w http.ResponseWriter, r *http.Request) {
 // Helper functions (ffmpeg, discovery, etc.)
 // ---------------------------------------------------------------------------
 
-func convertToMp4(tsFile, mp4File string) error {
+func convertToMp4(commander Commander, tsFile, mp4File string) error {
 	log.Printf("Converting %s to %s...", tsFile, mp4File)
 	args := []string{
 		"-i", tsFile,
@@ -1428,8 +1444,8 @@ func convertToMp4(tsFile, mp4File string) error {
 		"-y",
 		mp4File,
 	}
-	cmd := exec.Command("ffmpeg", args...)
-	if err := cmd.Run(); err != nil {
+	err := commander.RunCommand("ffmpeg", args...)
+	if err != nil {
 		log.Printf("ffmpeg conversion failed: %v, attempting slower conversion", err)
 
 		args = []string{
@@ -1442,8 +1458,7 @@ func convertToMp4(tsFile, mp4File string) error {
 			"-y",
 			mp4File,
 		}
-		cmd = exec.Command("ffmpeg", args...)
-		if err := cmd.Run(); err != nil {
+		if err = commander.RunCommand("ffmpeg", args...); err != nil {
 			return fmt.Errorf("ffmpeg conversion failed: %w", err)
 		}
 	}
@@ -1481,27 +1496,27 @@ func getFFmpegCommandString(inputURL string, durationSeconds int, outputFile str
 	return cmd
 }
 
-func isHttpServerError(logFile string) bool {
-	content, err := os.ReadFile(logFile)
+func isHttpServerError(a *App, logFile string) bool {
+	data, err := a.commander.ReadFile(logFile)
 	if err != nil {
 		return false
 	}
-	output := string(content)
+	output := string(data)
 	return strings.Contains(output, "HTTP error 503") ||
 		strings.Contains(output, "Server returned 5XX Server Error")
 }
 
 func (a *App) fetchTunerCount() int {
+
 	defaultCount := 4
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", "http://hdhomerun.local/discover.json", nil)
 	if err != nil {
 		log.Printf("Error creating tuner count request: %v, using default %d", err, defaultCount)
-		cancel()
 		return defaultCount
 	}
 	resp, err := http.DefaultClient.Do(req)
-	cancel()
 	if err != nil {
 		log.Printf("Error fetching tuner count: %v, using default %d", err, defaultCount)
 		return defaultCount
