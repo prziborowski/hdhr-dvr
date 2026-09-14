@@ -23,6 +23,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 
 	pkgcfg "github.com/prziborowski/hdhr-dvr/pkg/config"
+	"github.com/prziborowski/hdhr-dvr/pkg/ffmpeg"
 	"github.com/prziborowski/hdhr-dvr/pkg/types"
 )
 
@@ -131,6 +132,7 @@ func main() {
 	r.HandleFunc("/api/recordings/{id}", app.deleteRecording).Methods("DELETE")
 	r.HandleFunc("/api/recordings/{id}", app.updateRecording).Methods("PATCH")
 	r.HandleFunc("/api/recordings/{id}/file", app.getRecordingFile).Methods("GET", "HEAD")
+	r.HandleFunc("/api/recordings/{id}/convert", app.convertRecordingHandler).Methods("POST")
 	r.HandleFunc("/api/guide", app.getGuide).Methods("GET")
 	r.HandleFunc("/api/keywords", app.getKeywords).Methods("GET")
 	r.HandleFunc("/api/keywords", app.createKeyword).Methods("POST")
@@ -946,23 +948,11 @@ func (a *App) startRecording(r types.Recording) {
 		return
 	}
 
-	mp4File := strings.TrimSuffix(outputFile, filepath.Ext(outputFile)) + ".mp4"
-	if err := convertToMp4(a.commander, outputFile, mp4File); err != nil {
+	if err := a.convertRecordingFile(r); err != nil {
 		log.Printf("Conversion warning: %v", err)
-	} else {
-		_ = a.commander.Remove(outputFile)
-		if info, err := a.commander.Stat(mp4File); err == nil {
-			size := info.Size()
-			_, updateErr := a.dbExecContext(context.Background(), "UPDATE recordings SET file_size = ? WHERE id = ?", size, r.ID)
-			if updateErr != nil {
-				log.Printf("Error updating recording file size: %v", updateErr)
-			}
-		} else {
-			log.Printf("Error getting final recording file size: %v", err)
-		}
 	}
 
-	log.Printf("Recording completed successfully and converted to MP4: %s", mp4File)
+	log.Printf("Recording completed successfully and converted to MP4: %s", r.GetFilePath())
 }
 
 // getChannelInfo validates the channel exists and returns its details.
@@ -1255,6 +1245,106 @@ func (a *App) getRecordings(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// convertRecordingHandler converts a completed recording's .ts file to .mp4.
+// The conversion is synchronous: ffmpeg runs before the response is written, so
+// callers use a long HTTP timeout.
+func (a *App) convertRecordingHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	idStr := mux.Vars(r)["id"]
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "Invalid recording ID", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+
+	var recording types.Recording
+	err = a.dbQueryRowContext(ctx, `
+        SELECT id, channel_id, date, start_time, duration, status, title
+          FROM recordings
+          WHERE id = ?
+      `, id).Scan(&recording.ID, &recording.ChannelID, &recording.Date,
+		&recording.StartTime, &recording.Duration, &recording.Status, &recording.Title)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, "Recording not found", http.StatusNotFound)
+			return
+		}
+		log.Printf("Error loading recording %d: %v", id, err)
+		http.Error(w, "Failed to load recording", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON := func(status int, payload map[string]interface{}) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(payload)
+	}
+
+	if recording.Status != "completed" {
+		writeJSON(http.StatusConflict, map[string]interface{}{
+			"id":        id,
+			"converted": false,
+			"reason":    "not_completed",
+		})
+		return
+	}
+
+	tsPath := filepath.Join(a.config.StorageDir, recording.GetFilePath())
+	mp4Path := strings.TrimSuffix(tsPath, filepath.Ext(tsPath)) + ".mp4"
+
+	_, mp4StatErr := a.commander.Stat(mp4Path)
+	mp4Exists := mp4StatErr == nil
+	_, tsStatErr := a.commander.Stat(tsPath)
+	tsExists := tsStatErr == nil
+
+	// Idempotent: a recording that already has an .mp4 is left as-is.
+	if mp4Exists {
+		_ = a.commander.Remove(tsPath)
+		writeJSON(http.StatusOK, map[string]interface{}{
+			"id":        id,
+			"converted": false,
+			"reason":    "already_converted",
+		})
+		return
+	}
+
+	if !tsExists {
+		writeJSON(http.StatusConflict, map[string]interface{}{
+			"id":        id,
+			"converted": false,
+			"reason":    "no_ts_file",
+		})
+		return
+	}
+
+	if err := a.convertRecordingFile(recording); err != nil {
+		log.Printf("Error converting recording %d: %v", id, err)
+		writeJSON(http.StatusInternalServerError, map[string]interface{}{
+			"id":        id,
+			"converted": false,
+			"reason":    "conversion_failed",
+		})
+		return
+	}
+
+	var fileSize int64
+	if info, statErr := a.commander.Stat(mp4Path); statErr == nil {
+		fileSize = info.Size()
+	}
+
+	writeJSON(http.StatusOK, map[string]interface{}{
+		"id":        id,
+		"converted": true,
+		"file_size": fileSize,
+	})
+}
+
 func (a *App) getGuide(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1435,32 +1525,36 @@ func (a *App) deleteKeyword(w http.ResponseWriter, r *http.Request) {
 // Helper functions (ffmpeg, discovery, etc.)
 // ---------------------------------------------------------------------------
 
-func convertToMp4(commander Commander, tsFile, mp4File string) error {
-	log.Printf("Converting %s to %s...", tsFile, mp4File)
-	args := []string{
-		"-i", tsFile,
-		"-c", "copy",
-		"-movflags", "+faststart",
-		"-y",
-		mp4File,
-	}
-	err := commander.RunCommand("ffmpeg", args...)
-	if err != nil {
-		log.Printf("ffmpeg conversion failed: %v, attempting slower conversion", err)
+// convertRecordingFile converts a completed recording's .ts file to .mp4,
+// removes the original .ts, and records the new .mp4 size in the database.
+// It is a no-op when the .ts is already gone.
+func (a *App) convertRecordingFile(r types.Recording) error {
+	tsPath := filepath.Join(a.config.StorageDir, r.GetFilePath())
 
-		args = []string{
-			"-err_detect", "ignore_err",
-			"-fflags", "+genpts+discardcorrupt",
-			"-i", tsFile,
-			"-c", "copy",
-			"-map", "0",
-			"-f", "matroska",
-			"-y",
-			mp4File,
+	if _, err := a.commander.Stat(tsPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
 		}
-		if err = commander.RunCommand("ffmpeg", args...); err != nil {
-			return fmt.Errorf("ffmpeg conversion failed: %w", err)
-		}
+		return err
+	}
+
+	mp4Path := strings.TrimSuffix(tsPath, filepath.Ext(tsPath)) + ".mp4"
+
+	if err := ffmpeg.ConvertToMp4(a.commander, tsPath, mp4Path); err != nil {
+		return err
+	}
+
+	if err := a.commander.Remove(tsPath); err != nil {
+		return err
+	}
+
+	info, err := a.commander.Stat(mp4Path)
+	if err != nil {
+		return err
+	}
+	size := info.Size()
+	if _, err := a.dbExecContext(context.Background(), "UPDATE recordings SET file_size = ? WHERE id = ?", size, r.ID); err != nil {
+		return err
 	}
 	return nil
 }

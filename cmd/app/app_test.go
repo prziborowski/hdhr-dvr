@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -89,6 +90,19 @@ func (m *MockCommander) ReadFile(path string) ([]byte, error) {
 	return nil, fmt.Errorf("cannot read file")
 }
 
+// fakeFileInfo is a minimal os.FileInfo backed by a name and size.
+type fakeFileInfo struct {
+	name string
+	size int64
+}
+
+func (f *fakeFileInfo) Name() string       { return f.name }
+func (f *fakeFileInfo) Size() int64        { return f.size }
+func (f *fakeFileInfo) Mode() fs.FileMode  { return 0 }
+func (f *fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (f *fakeFileInfo) IsDir() bool        { return false }
+func (f *fakeFileInfo) Sys() interface{}   { return nil }
+
 // setupTestApp creates an App instance with an in-memory SQLite database.
 func setupTestApp(t *testing.T) (*App, *sql.DB) {
 	db, err := sql.Open("sqlite3", ":memory:")
@@ -135,16 +149,16 @@ func TestIsTunerAvailable(t *testing.T) {
 		req      RecordingRequest
 		expected bool
 	}{
-			{
-			name:      "Tuner Available (No overlap)",
+		{
+			name:     "Tuner Available (No overlap)",
 			req:      RecordingRequest{Date: "2026-07-14", StartTime: "14:00", Duration: 60},
 			expected: true,
-			},
-			{
-			name:      "Tuner Full (Overlap with both recordings)",
+		},
+		{
+			name:     "Tuner Full (Overlap with both recordings)",
 			req:      RecordingRequest{Date: "2026-07-14", StartTime: "12:45", Duration: 30},
 			expected: false,
-			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -407,22 +421,96 @@ func TestGetKeywordsHandler(t *testing.T) {
 	}
 }
 
-func TestConvertToMp4(t *testing.T) {
-	commander := &MockCommander{}
-	var capturedArgs []string
-	commander.StartCommandFunc = func(name string, stdout, stderr io.Writer, args ...string) (*exec.Cmd, error) {
-		capturedArgs = args
-		return &exec.Cmd{}, nil
-	}
+func TestConvertRecordingHandler(t *testing.T) {
+	app, db := setupTestApp(t)
+	defer db.Close() //nolint: errcheck
 
-	// Since we are mocking StartCommand to return a dummy *exec.Cmd, and that Cmd will fail on Wait(),
-	// the function will try the slower conversion as well.
-	err := convertToMp4(commander, "input.ts", "output.mp4")
+	// A completed recording whose .ts still exists on disk.
+	_, err := db.Exec("INSERT INTO recordings (id, channel_id, date, start_time, duration, status, title) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		7, "101", "2026-07-14", "12:00", 60, "completed", "Show")
 	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
 
-	if len(capturedArgs) == 0 {
-		t.Error("ffmpeg was never called")
+	tsPath := "/tmp/dvr_test/2026-07-14-12:00-Show.ts"
+	mp4Path := "/tmp/dvr_test/2026-07-14-12:00-Show.mp4"
+
+	// Fake on-disk state: the .ts exists, ffmpeg produces the .mp4.
+	files := map[string]int64{tsPath: 12345}
+	var removed []string
+
+	commander := app.commander.(*MockCommander)
+	commander.RunCommandFunc = func(name string, args ...string) error {
+		files[mp4Path] = 67890
+		delete(files, tsPath)
+		return nil
+	}
+	commander.StatFunc = func(path string) (os.FileInfo, error) {
+		if size, ok := files[path]; ok {
+			return &fakeFileInfo{name: path, size: size}, nil
+		}
+		return nil, os.ErrNotExist
+	}
+	commander.RemoveFunc = func(path string) error {
+		removed = append(removed, path)
+		delete(files, path)
+		return nil
+	}
+
+	r := mux.NewRouter()
+	r.HandleFunc("/api/recordings/{id}/convert", app.convertRecordingHandler).Methods("POST")
+
+	req := httptest.NewRequest("POST", "/api/recordings/7/convert", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("got code %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var resp struct {
+		ID        int   `json:"id"`
+		Converted bool  `json:"converted"`
+		FileSize  int64 `json:"file_size"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Converted || resp.ID != 7 || resp.FileSize != 67890 {
+		t.Errorf("unexpected response: %+v", resp)
+	}
+
+	var size int
+	if err := db.QueryRow("SELECT file_size FROM recordings WHERE id = 7").Scan(&size); err != nil {
+		t.Fatal(err)
+	}
+	if size != 67890 {
+		t.Errorf("expected persisted file_size 67890, got %d", size)
+	}
+
+	if len(removed) != 1 || removed[0] != tsPath {
+		t.Errorf("expected .ts to be removed, got %v", removed)
+	}
+}
+
+func TestConvertRecordingHandlerNotCompleted(t *testing.T) {
+	app, db := setupTestApp(t)
+	defer db.Close() //nolint: errcheck
+
+	_, err := db.Exec("INSERT INTO recordings (id, channel_id, date, start_time, duration, status, title) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		8, "101", "2026-07-14", "12:00", 60, "recording", "Live")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := mux.NewRouter()
+	r.HandleFunc("/api/recordings/{id}/convert", app.convertRecordingHandler).Methods("POST")
+
+	req := httptest.NewRequest("POST", "/api/recordings/8/convert", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("got code %d, want %d; body: %s", rr.Code, http.StatusConflict, rr.Body.String())
 	}
 }
