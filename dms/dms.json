@@ -1,0 +1,6 @@
+{
+  "http": ":4338",
+  "path": "/record",
+  "friendlyName": "HD Home Run recordings",
+  "noTranscode": true
+}
