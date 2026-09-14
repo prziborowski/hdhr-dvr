@@ -829,111 +829,37 @@ func (a *App) startRecordingTimer(recording types.Recording, startTime time.Time
 // ---------------------------------------------------------------------------
 
 func (a *App) startRecording(r types.Recording) {
-	ch, err := a.getChannelInfo(r.ChannelID)
+	ch, adjustedStart, adjDur, outputFile, logFile, err := a.prepareRecording(r)
 	if err != nil {
-		log.Printf("Error finding channel %s: %v", r.ChannelID, err)
+		log.Printf("Error preparing recording %d: %v", r.ID, err)
 		a.markFailed(r.ID)
 		return
 	}
-
-	loc, err := a.getLocalLocation()
-	if err != nil {
-		log.Printf("Error determining timezone: %v", err)
-	}
-
-	dateTimeStr := fmt.Sprintf("%s %s", r.Date, r.StartTime)
-	startTime, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
-	if err != nil {
-		log.Printf("Error parsing start time: %v", err)
-		a.markFailed(r.ID)
-		return
-	}
-
-	adjustedStartTime := startTime.Add(-preRollSeconds * time.Second)
-	adjustedDuration := r.Duration + postRollMinutes
-
-	log.Printf("Original start time: %v, Adjusted start time: %v, Original duration: %d, Adjusted duration: %d",
-		startTime, adjustedStartTime, r.Duration, adjustedDuration)
-
-	if err := a.commander.MkdirAll(a.config.StorageDir, 0755); err != nil {
-		log.Printf("Error creating output directory: %v", err)
-		a.markFailed(r.ID)
-		return
-	}
-
-	outputFile := filepath.Join(a.config.StorageDir, r.GetFilePath())
-	logFile := filepath.Join("/tmp", fmt.Sprintf("ffmpeg-%s-%s.log", r.Date, r.StartTime))
-	logFileHandle, err := a.commander.Create(logFile)
-	if err != nil {
-		log.Printf("Error creating log file: %v", err)
-		_, updateErr := a.dbExecContext(context.Background(), "UPDATE recordings SET status = 'failed' WHERE id = ?", r.ID)
-		if updateErr != nil {
-			log.Printf("Error updating recording status: %v", updateErr)
-		}
-		return
-	}
-	defer logFileHandle.Close() //nolint: errcheck
-
-	durationSeconds := adjustedDuration * 60
-	ffmpegArgs := buildFFmpegArgs(ch.URL, durationSeconds, outputFile)
-	cmd, err := a.commander.StartCommand("ffmpeg", logFileHandle, logFileHandle, ffmpegArgs...)
-	if err != nil {
-		log.Printf("Error starting ffmpeg: %v", err)
-		a.markFailed(r.ID)
-		return
-	}
-
-	log.Printf("Starting recording: %s", outputFile)
-	log.Printf("Channel: %s (%s)", ch.GuideName, ch.GuideNumber)
-	log.Printf("Original Date: %s, Original Time: %s, Adjusted Time: %v, Duration: %d minutes (original: %d)",
-		r.Date, r.StartTime, adjustedStartTime.Format("15:04"), adjustedDuration, r.Duration)
-	log.Printf("Storage directory: %s", a.config.StorageDir)
-	log.Printf("Log file: %s", logFile)
-	log.Printf("FFmpeg command: %s", getFFmpegCommandString(ch.URL, durationSeconds, outputFile))
+	defer logFile.Close()
 
 	if err := a.updateStatusWithRetry(r.ID, "recording"); err != nil {
-		logFileHandle.Close() //nolint: errcheck
 		return
 	}
 
-	a.runningProcesses.Store(r.ID, cmd)
-	defer a.runningProcesses.Delete(r.ID)
-
-	var runErr error
-	retryCount := 0
-	maxRetries := 3
-	backoff := []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second}
-
-	for retryCount <= maxRetries {
-		runErr = cmd.Run()
-		if runErr == nil {
-			break
-		}
-
-		log.Printf("Error running ffmpeg (attempt %d/%d): %v", retryCount+1, maxRetries+1, runErr)
-
-		if isHttpServerError(a, logFile) && retryCount < maxRetries {
-			wait := backoff[retryCount]
-			log.Printf("Detected HTTP server error, retrying in %v...", wait)
-			time.Sleep(wait)
-
-			ffmpegArgs := buildFFmpegArgs(ch.URL, durationSeconds, outputFile)
-			cmd, err = a.commander.StartCommand("ffmpeg", logFileHandle, logFileHandle, ffmpegArgs...)
-			if err != nil {
-				log.Printf("Error restarting ffmpeg: %v", err)
-				a.markFailed(r.ID)
-				return
-			}
-			a.runningProcesses.Store(r.ID, cmd)
-
-			retryCount++
-			continue
-		}
-		break
+	durationSeconds := adjDur * 60
+	cmd, runErr := a.runFFmpegWithRetries(ch, r, durationSeconds, outputFile, logFile)
+	if cmd == nil || runErr != nil {
+		log.Printf("Error running ffmpeg for recording %d: %v", r.ID, runErr)
+		a.markFailed(r.ID)
+		return
 	}
 
-	if runErr != nil {
-		log.Printf("Error running ffmpeg after retries: %v", runErr)
+	defer a.runningProcesses.Delete(r.ID)
+
+	log.Printf("Recording started successfully: %s", outputFile)
+	log.Printf("Channel: %s (%s)", ch.GuideName, ch.GuideNumber)
+	log.Printf("Original Date: %s, Original Time: %s, Adjusted Start: %v, Duration: %d minutes (original: %d)",
+		r.Date, r.StartTime, adjustedStart.Format("15:04"), adjDur, r.Duration)
+	log.Printf("Storage directory: %s", a.config.StorageDir)
+	log.Printf("Log file: %s", "/tmp/ffmpeg-log")
+
+	if runErr := cmd.Run(); runErr != nil {
+		log.Printf("Error running ffmpeg after retries for recording %d: %v", r.ID, runErr)
 		if _, err := a.commander.Stat(outputFile); err == nil {
 			a.updateStatusWithRetry(r.ID, "completed") //nolint:errcheck
 		} else {
@@ -945,24 +871,112 @@ func (a *App) startRecording(r types.Recording) {
 	if err := a.updateStatusWithRetry(r.ID, "completed"); err != nil {
 		return
 	}
+	a.finalizeRecording(r, outputFile)
+}
 
+// ---------------------------------------------------------------------------
+// prepareRecording — pre-flight checks and file system setup.
+// ---------------------------------------------------------------------------
+
+func (a *App) prepareRecording(r types.Recording) (types.Channel, time.Time, int, string, *os.File, error) {
+	ch, err := a.getChannelInfo(r.ChannelID)
+	if err != nil {
+		return ch, time.Time{}, 0, "", nil, fmt.Errorf("finding channel %s: %w", r.ChannelID, err)
+	}
+
+	loc, _ := a.getLocalLocation()
+	dateTimeStr := fmt.Sprintf("%s %s", r.Date, r.StartTime)
+	startTime, err := time.ParseInLocation("2006-01-02 15:04", dateTimeStr, loc)
+	if err != nil {
+		return ch, time.Time{}, 0, "", nil, fmt.Errorf("parsing start time: %w", err)
+	}
+
+	adjustedStartTime := startTime.Add(-preRollSeconds * time.Second)
+	adjustedDuration := r.Duration + postRollMinutes
+
+	log.Printf("Original start time: %v, Adjusted start time: %v, Original duration: %d, Adjusted duration: %d",
+		startTime, adjustedStartTime, r.Duration, adjustedDuration)
+
+	if err := a.commander.MkdirAll(a.config.StorageDir, 0755); err != nil {
+		return ch, time.Time{}, 0, "", nil, fmt.Errorf("creating output directory: %w", err)
+	}
+
+	outputFile := filepath.Join(a.config.StorageDir, r.GetFilePath())
+	logFile := filepath.Join("/tmp", fmt.Sprintf("ffmpeg-%s-%s.log", r.Date, r.StartTime))
+	logFileHandle, err := a.commander.Create(logFile)
+	if err != nil {
+		return ch, time.Time{}, 0, "", nil, fmt.Errorf("creating log file: %w", err)
+	}
+
+	return ch, adjustedStartTime, adjustedDuration, outputFile, logFileHandle, nil
+}
+
+// ---------------------------------------------------------------------------
+// runFFmpegWithRetries — executes ffmpeg with HTTP error retries and backoff.
+// ---------------------------------------------------------------------------
+
+func (a *App) runFFmpegWithRetries(ch types.Channel, r types.Recording, durationSeconds int, outputFile string, logFileHandle *os.File) (*exec.Cmd, error) {
+	maxRetries := 3
+	backoff := []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second}
+
+	var cmd *exec.Cmd
+	var err error
+
+	for retryCount := 0; retryCount <= maxRetries; retryCount++ {
+		if retryCount == 0 {
+			ffmpegArgs := buildFFmpegArgs(ch.URL, durationSeconds, outputFile)
+			cmd, err = a.commander.StartCommand("ffmpeg", logFileHandle, logFileHandle, ffmpegArgs...)
+			if err != nil {
+				log.Printf("Error starting ffmpeg: %v", err)
+				return nil, err
+			}
+		}
+
+		var runErr error
+		runErr = cmd.Run()
+		if runErr == nil {
+			a.runningProcesses.Store(r.ID, cmd)
+			return cmd, nil
+		}
+
+		log.Printf("Error running ffmpeg (attempt %d/%d): %v", retryCount+1, maxRetries+1, runErr)
+
+		if isHttpServerError(a, "/tmp/ffmpeg-log") && retryCount < maxRetries {
+			wait := backoff[retryCount]
+			log.Printf("Detected HTTP server error, retrying in %v...", wait)
+			time.Sleep(wait)
+			continue
+		}
+		break
+	}
+
+	return cmd, fmt.Errorf("ffmpeg failed after %d retries", maxRetries)
+}
+
+// ---------------------------------------------------------------------------
+// finalizeRecording — converts TS to MP4 and updates file size.
+// ---------------------------------------------------------------------------
+
+func (a *App) finalizeRecording(r types.Recording, outputFile string) error {
 	mp4File := strings.TrimSuffix(outputFile, filepath.Ext(outputFile)) + ".mp4"
 	if err := convertToMp4(a.commander, outputFile, mp4File); err != nil {
 		log.Printf("Conversion warning: %v", err)
-	} else {
-		_ = a.commander.Remove(outputFile)
-		if info, err := a.commander.Stat(mp4File); err == nil {
-			size := info.Size()
-			_, updateErr := a.dbExecContext(context.Background(), "UPDATE recordings SET file_size = ? WHERE id = ?", size, r.ID)
-			if updateErr != nil {
-				log.Printf("Error updating recording file size: %v", updateErr)
-			}
-		} else {
-			log.Printf("Error getting final recording file size: %v", err)
+		return err
+	}
+
+	_ = a.commander.Remove(outputFile)
+	if info, err := a.commander.Stat(mp4File); err == nil {
+		size := info.Size()
+		_, updateErr := a.dbExecContext(context.Background(), "UPDATE recordings SET file_size = ? WHERE id = ?", size, r.ID)
+		if updateErr != nil {
+			log.Printf("Error updating recording file size: %v", updateErr)
 		}
+	} else {
+		log.Printf("Error getting final recording file size: %v", err)
 	}
 
 	log.Printf("Recording completed successfully and converted to MP4: %s", mp4File)
+	return nil
 }
 
 // getChannelInfo validates the channel exists and returns its details.
