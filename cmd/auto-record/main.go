@@ -42,7 +42,10 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	apiBaseURL := "http://localhost:8080"
+	apiBaseURL, err := pkgcfg.APIBaseURL()
+	if err != nil {
+		log.Fatalf("invalid API_BASE_URL: %v", err)
+	}
 
 	// Load keywords via API
 	keywords, err := fetchKeywords(apiBaseURL)

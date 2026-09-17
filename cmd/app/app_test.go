@@ -514,3 +514,213 @@ func TestConvertRecordingHandlerNotCompleted(t *testing.T) {
 		t.Fatalf("got code %d, want %d; body: %s", rr.Code, http.StatusConflict, rr.Body.String())
 	}
 }
+
+func postGuide(t *testing.T, app *App, guide types.Guide) {
+	t.Helper()
+	body, err := json.Marshal(guide)
+	if err != nil {
+		t.Fatalf("failed to marshal guide: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/api/guide", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	app.setGuide(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("setGuide returned code %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+}
+
+func TestSetGuideHandler(t *testing.T) {
+	app, db := setupTestApp(t)
+	defer db.Close() //nolint: errcheck
+
+	guide := types.Guide{
+		Channels: []types.LineupData{
+			{StationID: "1", ChannelNumber: "101", StationCallSign: "KABC", Logo: "abc.png"},
+			{StationID: "2", ChannelNumber: "202", StationCallSign: "KXTV", Logo: "xtv.png"},
+		},
+		Programs: []types.Program{
+			{Channel: "101", Title: "News", SubTitle: "Morning", Start: "2026-01-01T00:00:00Z", End: "2026-01-01T01:00:00Z", Duration: 60, Category: "news"},
+			{Channel: "202", Title: "Movie", Start: "2026-01-01T02:00:00Z", End: "2026-01-01T04:00:00Z", Duration: 120, Category: "movie", New: true},
+		},
+		Generated: "2026-01-01T00:00:00Z",
+	}
+
+	postGuide(t, app, guide)
+
+	var chCount, progCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM guide_channels").Scan(&chCount); err != nil {
+		t.Fatal(err)
+	}
+	if chCount != 2 {
+		t.Errorf("expected 2 guide_channels, got %d", chCount)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM guide_programs").Scan(&progCount); err != nil {
+		t.Fatal(err)
+	}
+	if progCount != 2 {
+		t.Errorf("expected 2 guide_programs, got %d", progCount)
+	}
+
+	var generated string
+	if err := db.QueryRow("SELECT generated FROM guide_meta WHERE id = 1").Scan(&generated); err != nil {
+		t.Fatal(err)
+	}
+	if generated != "2026-01-01T00:00:00Z" {
+		t.Errorf("expected generated %q, got %q", "2026-01-01T00:00:00Z", generated)
+	}
+
+	if len(app.guideData.Channels) != 2 {
+		t.Errorf("expected in-memory 2 channels, got %d", len(app.guideData.Channels))
+	}
+	if len(app.guideData.Programs) != 2 {
+		t.Errorf("expected in-memory 2 programs, got %d", len(app.guideData.Programs))
+	}
+}
+
+func TestSetGuideReplaces(t *testing.T) {
+	app, db := setupTestApp(t)
+	defer db.Close() //nolint: errcheck
+
+	g1 := types.Guide{
+		Channels:  []types.LineupData{{StationID: "1", ChannelNumber: "101"}},
+		Programs:  []types.Program{{Channel: "101", Title: "A", Start: "2026-01-01T00:00:00Z", End: "2026-01-01T01:00:00Z", Duration: 60}},
+		Generated: "gen-1",
+	}
+	postGuide(t, app, g1)
+
+	g2 := types.Guide{
+		Channels: []types.LineupData{
+			{StationID: "3", ChannelNumber: "303"},
+			{StationID: "4", ChannelNumber: "404"},
+			{StationID: "5", ChannelNumber: "505"},
+		},
+		Programs: []types.Program{
+			{Channel: "303", Title: "B", Start: "2026-01-01T00:00:00Z", End: "2026-01-01T01:00:00Z", Duration: 60},
+			{Channel: "404", Title: "C", Start: "2026-01-01T00:00:00Z", End: "2026-01-01T01:00:00Z", Duration: 60},
+		},
+		Generated: "gen-2",
+	}
+	postGuide(t, app, g2)
+
+	var chCount, progCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM guide_channels").Scan(&chCount); err != nil {
+		t.Fatal(err)
+	}
+	if chCount != 3 {
+		t.Errorf("expected 3 guide_channels after replace, got %d", chCount)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM guide_programs").Scan(&progCount); err != nil {
+		t.Fatal(err)
+	}
+	if progCount != 2 {
+		t.Errorf("expected 2 guide_programs after replace, got %d", progCount)
+	}
+
+	// The old channel must be gone.
+	var stale int
+	if err := db.QueryRow("SELECT COUNT(*) FROM guide_channels WHERE station_id = '1'").Scan(&stale); err != nil {
+		t.Fatal(err)
+	}
+	if stale != 0 {
+		t.Errorf("expected old channel gone, found %d", stale)
+	}
+
+	// guide_meta should reflect the latest generated value.
+	var generated string
+	if err := db.QueryRow("SELECT generated FROM guide_meta WHERE id = 1").Scan(&generated); err != nil {
+		t.Fatal(err)
+	}
+	if generated != "gen-2" {
+		t.Errorf("expected generated %q, got %q", "gen-2", generated)
+	}
+
+	if len(app.guideData.Channels) != 3 || len(app.guideData.Programs) != 2 {
+		t.Errorf("expected in-memory 3 channels / 2 programs, got %d / %d", len(app.guideData.Channels), len(app.guideData.Programs))
+	}
+}
+
+func TestSetGuideMethodNotAllowed(t *testing.T) {
+	app, _ := setupTestApp(t)
+
+	r := mux.NewRouter()
+	r.HandleFunc("/api/guide", app.setGuide).Methods("POST", "PUT")
+
+	req := httptest.NewRequest("GET", "/api/guide", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("got code %d, want %d", rr.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestSetGuideBadBody(t *testing.T) {
+	app, _ := setupTestApp(t)
+
+	// Invalid JSON body with correct content type.
+	req := httptest.NewRequest("POST", "/api/guide", bytes.NewBufferString("not json"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	app.setGuide(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("invalid JSON: got code %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+
+	// Wrong content type.
+	req2 := httptest.NewRequest("POST", "/api/guide", bytes.NewBufferString(`{"channels":[]}`))
+	req2.Header.Set("Content-Type", "text/plain")
+	rr2 := httptest.NewRecorder()
+	app.setGuide(rr2, req2)
+	if rr2.Code != http.StatusBadRequest {
+		t.Errorf("wrong content type: got code %d, want %d", rr2.Code, http.StatusBadRequest)
+	}
+}
+
+func TestLoadGuideFromDB(t *testing.T) {
+	app, db := setupTestApp(t)
+	defer db.Close() //nolint: errcheck
+
+	_, err := db.Exec(`INSERT INTO guide_channels (station_id, channel_number, station_call_sign, logo) VALUES ('1', '101', 'KABC', 'abc.png')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO guide_channels (station_id, channel_number, station_call_sign, logo) VALUES ('2', '202', 'KXTV', 'xtv.png')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO guide_programs (channel, title, subtitle, start, "end", duration, category, is_new) VALUES ('101', 'News', 'Morning', '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z', 60, 'news', 1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO guide_programs (channel, title, subtitle, start, "end", duration, category, is_new) VALUES ('202', 'Movie', '', '2026-01-01T02:00:00Z', '2026-01-01T04:00:00Z', 120, 'movie', 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO guide_meta (id, generated) VALUES (1, '2026-01-01T00:00:00Z')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app.loadGuideFromDB()
+
+	if len(app.guideData.Channels) != 2 {
+		t.Errorf("expected 2 channels, got %d", len(app.guideData.Channels))
+	}
+	if len(app.guideData.Programs) != 2 {
+		t.Errorf("expected 2 programs, got %d", len(app.guideData.Programs))
+	}
+	if app.guideData.Generated != "2026-01-01T00:00:00Z" {
+		t.Errorf("expected generated %q, got %q", "2026-01-01T00:00:00Z", app.guideData.Generated)
+	}
+
+	newsFound := false
+	for _, p := range app.guideData.Programs {
+		if p.Title == "News" && p.New {
+			newsFound = true
+		}
+	}
+	if !newsFound {
+		t.Error("expected News program to have New=true decoded from is_new")
+	}
+}

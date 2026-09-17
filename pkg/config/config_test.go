@@ -13,8 +13,6 @@ func TestLoadConfig_ValidAllFields(t *testing.T) {
 				"timezone": "America/New_York",
 				"lineUpID": "test-lineup",
 				"days": 5,
-				"guideFile": "epg.json",
-				"stateFile": "state.json",
 				"storageDir": "/tmp/recordings",
 				"userId": "test-user-id"
 			}`
@@ -33,8 +31,6 @@ func TestLoadConfig_ValidAllFields(t *testing.T) {
 	assertString(t, "userID", cfg.UserID, "test-user-id")
 	assertString(t, "lineUpID", cfg.LineUpID, "test-lineup")
 	assertInt(t, "days", cfg.Days, 5)
-	assertString(t, "guideFile", cfg.GuideFile, "epg.json")
-	assertString(t, "stateFile", cfg.StateFile, "state.json")
 	assertString(t, "storageDir", cfg.StorageDir, "/tmp/recordings")
 }
 
@@ -103,48 +99,6 @@ func TestLoadConfig_DaysClampedTo8_GreaterThan8(t *testing.T) {
 	assertInt(t, "days clamped to 8", cfg.Days, 8)
 }
 
-func TestLoadConfig_DefaultGuideFile(t *testing.T) {
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.json")
-	configContent := `{
-				"lineUpID": "test",
-				"storageDir": "/tmp/rec"
-			}`
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatal(err)
-	}
-	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)   //nolint:errcheck
-	defer os.Chdir(wd) //nolint:errcheck
-
-	cfg, err := LoadConfig()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	assertString(t, "guideFile default", cfg.GuideFile, "guide.json")
-}
-
-func TestLoadConfig_DefaultStateFile(t *testing.T) {
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.json")
-	configContent := `{
-				"lineUpID": "test",
-				"storageDir": "/tmp/rec"
-			}`
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatal(err)
-	}
-	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)   //nolint:errcheck
-	defer os.Chdir(wd) //nolint:errcheck
-
-	cfg, err := LoadConfig()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	assertString(t, "stateFile default", cfg.StateFile, "guide_state.json")
-}
-
 func TestLoadConfig_InvalidJSON(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.json")
@@ -182,5 +136,49 @@ func assertString(t *testing.T, label string, got, want string) {
 func assertInt(t *testing.T, label string, got, want int) {
 	if got != want {
 		t.Fatalf("%s: expected %d, got %d", label, want, got)
+	}
+}
+
+func TestAPIBaseURL_Default(t *testing.T) {
+	t.Setenv("API_BASE_URL", "")
+	got, err := APIBaseURL()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertString(t, "default base url", got, DefaultAPIBaseURL)
+}
+
+func TestAPIBaseURL_FromEnv(t *testing.T) {
+	t.Setenv("API_BASE_URL", "http://svc:8080")
+	got, err := APIBaseURL()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertString(t, "env base url", got, "http://svc:8080")
+}
+
+func TestAPIBaseURL_TrimsTrailingSlash(t *testing.T) {
+	t.Setenv("API_BASE_URL", "http://svc:8080/")
+	got, err := APIBaseURL()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertString(t, "trimmed base url", got, "http://svc:8080")
+}
+
+func TestAPIBaseURL_EmptyEnv(t *testing.T) {
+	t.Setenv("API_BASE_URL", "   ")
+	got, err := APIBaseURL()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertString(t, "empty env base url", got, DefaultAPIBaseURL)
+}
+
+func TestAPIBaseURL_Invalid(t *testing.T) {
+	t.Setenv("API_BASE_URL", "not a url")
+	_, err := APIBaseURL()
+	if err == nil {
+		t.Fatal("expected error for invalid API_BASE_URL")
 	}
 }

@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"sort"
 	"time"
 
@@ -82,8 +82,8 @@ func fetchTitanTVScheduleBlock(userId, lineupId string, startTime time.Time) (*t
 	return &response, nil
 }
 
-func fetchLocalChannels() ([]types.Channel, error) {
-	resp, err := http.Get("http://localhost:8080/api/channels")
+func fetchLocalChannels(baseURL string) ([]types.Channel, error) {
+	resp, err := http.Get(baseURL + "/api/channels")
 	if err != nil {
 		return nil, err
 	}
@@ -101,11 +101,43 @@ func fetchLocalChannels() ([]types.Channel, error) {
 	return channels, nil
 }
 
+func pushGuide(apiBaseURL string, guide types.Guide) error {
+	body, err := json.Marshal(guide)
+	if err != nil {
+		return fmt.Errorf("marshaling guide: %w", err)
+	}
+	client := &http.Client{Timeout: 60 * time.Second}
+	url := apiBaseURL + "/api/guide"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("creating guide request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("sending guide to %s: %w", url, err)
+	}
+	defer resp.Body.Close() //nolint: errcheck
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		var errMsg map[string]string
+		if err := json.NewDecoder(resp.Body).Decode(&errMsg); err == nil {
+			return fmt.Errorf("API error (%d): %s", resp.StatusCode, errMsg["error"])
+		}
+		return fmt.Errorf("unexpected status code from %s: %d", url, resp.StatusCode)
+	}
+	return nil
+}
 func main() {
 	// Load configuration
 	config, err := pkgcfg.LoadConfig()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	apiBaseURL, err := pkgcfg.APIBaseURL()
+	if err != nil {
+		log.Fatalf("invalid API_BASE_URL: %v", err)
 	}
 
 	loc, err := time.LoadLocation(config.Timezone)
@@ -116,7 +148,7 @@ func main() {
 	log.Printf("Fetching guide data from TitanTV for UserID: %s and LineupID: %s", config.UserID, config.LineUpID)
 
 	// 1. Fetch Local Channels for filtering
-	localChannels, err := fetchLocalChannels()
+	localChannels, err := fetchLocalChannels(apiBaseURL)
 	if err != nil {
 		log.Printf("Error fetching local channels from API: %v. Exiting because local channel list is required for filtering.", err)
 		log.Fatalf("Cannot generate guide without local channel list")
@@ -264,13 +296,8 @@ func main() {
 		Generated: time.Now().Format(time.RFC3339),
 	}
 
-	outputData, err := json.MarshalIndent(output, "", "  ")
-	if err != nil {
-		log.Fatalf("Error encoding JSON: %v", err)
+	if err := pushGuide(apiBaseURL, output); err != nil {
+		log.Fatalf("Error pushing guide to API: %v", err)
 	}
-	if err := os.WriteFile(config.GuideFile, outputData, 0644); err != nil {
-		log.Fatalf("Error writing output file: %v", err)
-	}
-
-	log.Printf("Successfully generated %s with %d programs", config.GuideFile, len(allPrograms))
+	log.Printf("Successfully pushed %d programs to %s", len(allPrograms), apiBaseURL)
 }

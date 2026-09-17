@@ -2,8 +2,6 @@
   "timezone": "America/Los_Angeles",
   "lineUpID": "abcdef12-3456-7890-abcd-ef0123456789",
   "days": 8,
-  "guideFile": "guide.json",
-  "stateFile": "guide_state.json",
   "storageDir": "/media/data/recordings",
   "userId": "abcdef12-3456-7890-abcd-ef0123456789"
 }

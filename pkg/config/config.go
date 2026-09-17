@@ -2,17 +2,35 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"net/url"
 	"os"
+	"strings"
 )
+
+const DefaultAPIBaseURL = "http://localhost:8080"
+
+// APIBaseURL returns the app API base URL from the API_BASE_URL env var,
+// falling back to DefaultAPIBaseURL. Trims surrounding whitespace and a
+// trailing slash, and validates the result is a parseable URL with a host.
+func APIBaseURL() (string, error) {
+	v := strings.TrimRight(strings.TrimSpace(os.Getenv("API_BASE_URL")), "/")
+	if v == "" {
+		return DefaultAPIBaseURL, nil
+	}
+	u, err := url.Parse(v)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("invalid API_BASE_URL %q: %w", v, err)
+	}
+	return v, nil
+}
 
 type Config struct {
 	Timezone   string `json:"timezone"`
 	UserID     string `json:"userId"`
 	LineUpID   string `json:"lineUpID"`
 	Days       int    `json:"days"`
-	GuideFile  string `json:"guideFile"`
-	StateFile  string `json:"stateFile"`
 	StorageDir string `json:"storageDir"`
 }
 
@@ -37,14 +55,6 @@ func LoadConfig() (*Config, error) {
 	if config.Days == 0 || config.Days > 8 {
 		log.Printf("WARNING: days=%d is invalid, clamping to 8", config.Days)
 		config.Days = 8
-	}
-	if config.GuideFile == "" {
-		config.GuideFile = "guide.json"
-		log.Println("WARNING: guideFile not set, defaulting to guide.json")
-	}
-	if config.StateFile == "" {
-		config.StateFile = "guide_state.json"
-		log.Println("WARNING: stateFile not set, defaulting to guide_state.json")
 	}
 
 	if config.StorageDir == "" {

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hdhr-dvr-config
+  namespace: default
+data:
+  config.json: |
+     {
+       "timezone": "America/Los_Angeles",
+       "lineUpID": "REPLACE_LINEUP_ID",
+       "userId": "REPLACE_USER_ID",
+       "days": 8,
+       "storageDir": "/data/recordings"
+     }

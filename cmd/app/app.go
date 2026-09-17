@@ -18,7 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
 
@@ -55,7 +54,6 @@ type App struct {
 	tunerCount           int
 	guideData            types.Guide
 	guideDataMutex       sync.RWMutex
-	watcher              *fsnotify.Watcher
 	runningProcesses     sync.Map // key: recording ID, value: *exec.Cmd
 	enabledChannels      map[string]bool
 	enabledChannelsMutex sync.RWMutex
@@ -101,9 +99,7 @@ func main() {
 	app.loadEnabledChannels()
 	app.loadChannels()
 
-	if app.loadGuide() {
-		go app.setupFileWatcher(app.config.GuideFile)
-	}
+	app.loadGuideFromDB()
 
 	app.loadRecordings()
 	app.cleanupOldRecordings()
@@ -134,6 +130,7 @@ func main() {
 	r.HandleFunc("/api/recordings/{id}/file", app.getRecordingFile).Methods("GET", "HEAD")
 	r.HandleFunc("/api/recordings/{id}/convert", app.convertRecordingHandler).Methods("POST")
 	r.HandleFunc("/api/guide", app.getGuide).Methods("GET")
+	r.HandleFunc("/api/guide", app.setGuide).Methods("POST", "PUT")
 	r.HandleFunc("/api/keywords", app.getKeywords).Methods("GET")
 	r.HandleFunc("/api/keywords", app.createKeyword).Methods("POST")
 	r.HandleFunc("/api/keywords/{id}", app.deleteKeyword).Methods("DELETE")
@@ -556,6 +553,27 @@ func (a *App) createTables() {
             enabled INTEGER DEFAULT 1,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
          );
+        CREATE TABLE IF NOT EXISTS guide_channels (
+            station_id TEXT PRIMARY KEY,
+            channel_number TEXT,
+            station_call_sign TEXT,
+            logo TEXT
+            );
+        CREATE TABLE IF NOT EXISTS guide_programs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel TEXT,
+            title TEXT,
+            subtitle TEXT,
+            start TEXT,
+            "end" TEXT,
+            duration INTEGER,
+            category TEXT,
+            is_new INTEGER DEFAULT 0
+            );
+        CREATE TABLE IF NOT EXISTS guide_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generated TEXT
+            );
      `)
 	if err != nil {
 		log.Fatal(err)
@@ -1016,71 +1034,131 @@ func (a *App) updateStatusWithRetry(id int, status string) error {
 }
 
 // ---------------------------------------------------------------------------
-// File watching & guide loading
+// Guide loading (from database) & ingest
 // ---------------------------------------------------------------------------
 
-func (a *App) loadGuide() bool {
-	if _, err := a.commander.Stat(a.config.GuideFile); err != nil && os.IsNotExist(err) {
-		log.Println("No guide.json found, skipping")
-		return false
-	}
+func (a *App) loadGuideFromDB() {
+	ctx := context.Background()
+	guide := types.Guide{}
 
-	file, err := a.commander.Open(a.config.GuideFile)
+	rows, err := a.dbQueryContext(ctx, "SELECT station_id, channel_number, station_call_sign, logo FROM guide_channels")
 	if err != nil {
-		log.Printf("Error opening guide.json: %v", err)
-		return false
+		log.Printf("Error loading guide channels: %v", err)
+	} else {
+		defer rows.Close()
+		for rows.Next() {
+			var c types.LineupData
+			if err := rows.Scan(&c.StationID, &c.ChannelNumber, &c.StationCallSign, &c.Logo); err != nil {
+				log.Printf("Error scanning guide channel: %v", err)
+				continue
+			}
+			guide.Channels = append(guide.Channels, c)
+		}
 	}
-	defer file.Close() //nolint: errcheck
 
-	var newGuideData types.Guide
-	if err := json.NewDecoder(file).Decode(&newGuideData); err != nil {
-		log.Printf("Error decoding guide.json: %v", err)
-		return false
+	prows, err := a.dbQueryContext(ctx, `SELECT channel, title, subtitle, start, "end", duration, category, is_new FROM guide_programs ORDER BY start, channel`)
+	if err != nil {
+		log.Printf("Error loading guide programs: %v", err)
+	} else {
+		defer prows.Close()
+		for prows.Next() {
+			var p types.Program
+			var isNew int
+			if err := prows.Scan(&p.Channel, &p.Title, &p.SubTitle, &p.Start, &p.End, &p.Duration, &p.Category, &isNew); err != nil {
+				log.Printf("Error scanning guide program: %v", err)
+				continue
+			}
+			if isNew != 0 {
+				p.New = true
+			}
+			guide.Programs = append(guide.Programs, p)
+		}
 	}
+
+	var generated string
+	if err := a.dbQueryRowContext(ctx, "SELECT generated FROM guide_meta WHERE id = 1").Scan(&generated); err != nil && err != sql.ErrNoRows {
+		log.Printf("Error loading guide meta: %v", err)
+	}
+	guide.Generated = generated
 
 	a.guideDataMutex.Lock()
-	a.guideData = newGuideData
+	a.guideData = guide
 	a.guideDataMutex.Unlock()
-
-	log.Printf("Loaded guide data: %d programs", len(newGuideData.Programs))
-	return true
+	log.Printf("Loaded guide data from db: %d channels, %d programs", len(guide.Channels), len(guide.Programs))
 }
 
-func (a *App) setupFileWatcher(filePath string) {
-	var err error
-	a.watcher, err = fsnotify.NewWatcher()
+func (a *App) replaceGuideInDB(guide *types.Guide) error {
+	ctx := context.Background()
+	tx, err := a.store.BeginTx(ctx, nil)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	defer a.watcher.Close() //nolint: errcheck
-
-	go func() {
-		for {
-			select {
-			case event, ok := <-a.watcher.Events:
-				if !ok {
-					return
-				}
-				if event.Op&fsnotify.Write == fsnotify.Write {
-					log.Println("Modified file detected:", event.Name)
-					a.loadGuide() //nolint:errcheck
-				}
-			case err, ok := <-a.watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Println("Error:", err)
-			}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM guide_channels"); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM guide_programs"); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO guide_meta (id, generated) VALUES (1, ?)`, guide.Generated); err != nil {
+		tx.Rollback()
+		return err
+	}
+	for _, c := range guide.Channels {
+		if _, err := tx.ExecContext(ctx, "INSERT OR REPLACE INTO guide_channels (station_id, channel_number, station_call_sign, logo) VALUES (?, ?, ?, ?)",
+			c.StationID, c.ChannelNumber, c.StationCallSign, c.Logo); err != nil {
+			tx.Rollback()
+			return err
 		}
-	}()
+	}
+	for _, p := range guide.Programs {
+		isNew := 0
+		if p.New {
+			isNew = 1
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO guide_programs (channel, title, subtitle, start, "end", duration, category, is_new) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			p.Channel, p.Title, p.SubTitle, p.Start, p.End, p.Duration, p.Category, isNew); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
 
-	err = a.watcher.Add(filePath)
-	if err != nil {
-		log.Printf("Error adding watcher for %s: %v", filePath, err)
+func (a *App) setGuide(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if r.Header.Get("Content-Type") != "application/json" {
+		http.Error(w, "Content-Type must be application/json", http.StatusBadRequest)
+		return
+	}
+	var guide types.Guide
+	if err := json.NewDecoder(r.Body).Decode(&guide); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"}) //nolint: errcheck
+		return
+	}
+	if err := a.replaceGuideInDB(&guide); err != nil {
+		log.Printf("Error replacing guide in db: %v", err)
+		http.Error(w, "Failed to store guide", http.StatusInternalServerError)
+		return
+	}
+	a.guideDataMutex.Lock()
+	a.guideData = guide
+	a.guideDataMutex.Unlock()
+	log.Printf("Replaced guide data via API: %d channels, %d programs", len(guide.Channels), len(guide.Programs))
 
-	select {}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{ //nolint: errcheck
+		"channels":  len(guide.Channels),
+		"programs":  len(guide.Programs),
+		"generated": guide.Generated,
+	})
 }
 
 // ---------------------------------------------------------------------------
