@@ -5,7 +5,7 @@
 | Path | Purpose |
 |------|---------|
 | `cmd/app/app.go` | Main DVR app — single large file (~1800 LOC). All DB helpers, HTTP handlers, ffmpeg recording logic |
-| `cmd/guide/guide.go` | CLI: fetches EPG from TitanTV, writes `guide.json` |
+| `cmd/guide/guide.go` | CLI: fetches EPG from TitanTV and pushes it to the app over HTTP (POST /api/guide); no shared `guide.json` |
 | `cmd/auto-record/main.go` | CLI: matches guide programs against keywords, schedules recordings via API |
 | `update_sizes.go` | Standalone script: scans filesystem and sets file_size in DB |
 | `pkg/config/config.go` | Config struct + LoadConfig() from `config.json` |
@@ -30,7 +30,7 @@ No Makefile. The app expects `config.json` in the working directory.
 
 ## config.json (single source of truth)
 
-Fields: `timezone`, `lineUpID`, `days`, `guideFile`, `stateFile`, `storageDir`, `userId`
+Fields: `timezone`, `lineUpID`, `days`, `storageDir`, `userId`
 
 ## Architecture notes
 
@@ -38,7 +38,8 @@ Fields: `timezone`, `lineUpID`, `days`, `guideFile`, `stateFile`, `storageDir`, 
 - **DB**: SQLite at `./recordings.db`. Connection pool: MaxOpenConns=10, MaxIdleConns=5.
 - **No context timeout wrapping in db helpers**: `dbQueryContext`, `dbExecContext`, and `dbQueryRowContext` are thin passthroughs to `db.QueryContext/ExecContext/QueryRowContext`. Callers manage their own timeouts — do NOT add `context.WithTimeout` inside these helpers or you'll get "context canceled" errors.
 - **Recording lifecycle**: pending → recording → completed/failed. Status transitions involve file existence checks on disk.
-- **Startup sequence** (in `main()`): init DB → load config → fetch tuner count → create tables → load channels → load guide → load recordings → cleanup old → start scheduler goroutine.
+- **Startup sequence** (in `main()`): init DB → load config → fetch tuner count → create tables → load channels → load guide from DB (loadGuideFromDB) → load recordings → cleanup old → start scheduler goroutine.
+- **Guide ingest**: `POST /api/guide` (with `PUT /api/guide` as an alias) replaces the in-memory and stored guide with a full EPG snapshot; guide data is persisted in the app's SQLite DB (`guide_channels`/`guide_programs`/`guide_meta` tables) instead of a watched `guide.json` file.
 
 ## Key patterns & gotchas
 

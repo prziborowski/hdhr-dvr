@@ -37,12 +37,7 @@ spec:
                   mountPath: /app/config.json
                   subPath: config.json
                   readOnly: true
-                - name: data
-                  mountPath: /data
           volumes:
             - name: config
               configMap:
                 name: hdhr-dvr-config
-            - name: data
-              persistentVolumeClaim:
-                claimName: hdhr-dvr-data

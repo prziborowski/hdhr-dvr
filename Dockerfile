@@ -30,7 +30,7 @@ COPY --from=build /out/guide       /usr/local/bin/guide
 COPY --from=build /out/auto-record /usr/local/bin/auto-record
 COPY --from=build /out/convert-ts  /usr/local/bin/convert-ts
 
-# config.json / guide.json / recordings.db are relative to CWD.
+# config.json / recordings.db are relative to CWD.
 WORKDIR /app
 
 # No ENTRYPOINT so k8s CronJobs can set `command` per job.

@@ -40,7 +40,7 @@ bin/app    # Starts web UI on http://localhost:8080
 Fetch EPG guide data from TitanTV:
 
 ```bash
-bin/guide   # Fetches channel guide, writes guide.json
+bin/guide   # Fetches EPG from TitanTV and pushes it to the app (POST /api/guide)
 ```
 
 Auto-schedule recordings by keyword:
@@ -65,8 +65,6 @@ Edit the fields in `config.json`:
 | `lineUpID` | Yes | Your TitanTV lineup ID. Obtain from your TitanTV account. |
 | `userId` | Yes | Your TitanTV user ID. Obtain from your TitanTV account. |
 | `days` | Yes | Number of EPG days to fetch (max 8). |
-| `guideFile` | No | Path for EPG output file. Defaults to `guide.json`. |
-| `stateFile` | No | Path for TitanTV state file. Defaults to `guide_state.json`. |
 | `storageDir` | Yes | Directory where recorded files are saved. |
 To obtain `lineUpID` and `userId`:
 
@@ -76,7 +74,7 @@ To obtain `lineUpID` and `userId`:
 
 ### Database
 
-The application uses SQLite at `./recordings.db`. The database is created automatically on first run.
+The application uses SQLite at `./recordings.db`. The database is created automatically on first run. The EPG guide is also stored in the database (new `guide_channels`/`guide_programs`/`guide_meta` tables) instead of a shared `guide.json` file.
 
 ### Usage
 
@@ -104,6 +102,17 @@ The application uses SQLite at `./recordings.db`. The database is created automa
 ```
 * `DELETE /api/recordings/{id}` - Delete a recording
 * `GET /api/recordings/{id}/file` - Download a recording file
+
+### Guide
+
+* `POST /api/guide` - Replace the app's in-memory and stored guide with a full EPG snapshot (channels + programs + generated timestamp). This is how `bin/guide` updates the guide; the app persists it to SQLite so the guide survives restarts with no shared `guide.json` required. `PUT /api/guide` is accepted as an alias.
+```json
+{
+    "channels": [ ... ],
+    "programs": [ ... ],
+    "generated": "2026-01-01T00:00:00Z"
+}
+```
 
 ## Development
 

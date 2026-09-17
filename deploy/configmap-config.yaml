@@ -10,7 +10,5 @@ data:
        "lineUpID": "REPLACE_LINEUP_ID",
        "userId": "REPLACE_USER_ID",
        "days": 8,
-       "guideFile": "/data/guide.json",
-       "stateFile": "guide_state.json",
        "storageDir": "/data/recordings"
      }

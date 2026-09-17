@@ -13,8 +13,6 @@ func TestLoadConfig_ValidAllFields(t *testing.T) {
 				"timezone": "America/New_York",
 				"lineUpID": "test-lineup",
 				"days": 5,
-				"guideFile": "epg.json",
-				"stateFile": "state.json",
 				"storageDir": "/tmp/recordings",
 				"userId": "test-user-id"
 			}`
@@ -33,8 +31,6 @@ func TestLoadConfig_ValidAllFields(t *testing.T) {
 	assertString(t, "userID", cfg.UserID, "test-user-id")
 	assertString(t, "lineUpID", cfg.LineUpID, "test-lineup")
 	assertInt(t, "days", cfg.Days, 5)
-	assertString(t, "guideFile", cfg.GuideFile, "epg.json")
-	assertString(t, "stateFile", cfg.StateFile, "state.json")
 	assertString(t, "storageDir", cfg.StorageDir, "/tmp/recordings")
 }
 
@@ -101,48 +97,6 @@ func TestLoadConfig_DaysClampedTo8_GreaterThan8(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertInt(t, "days clamped to 8", cfg.Days, 8)
-}
-
-func TestLoadConfig_DefaultGuideFile(t *testing.T) {
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.json")
-	configContent := `{
-				"lineUpID": "test",
-				"storageDir": "/tmp/rec"
-			}`
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatal(err)
-	}
-	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)   //nolint:errcheck
-	defer os.Chdir(wd) //nolint:errcheck
-
-	cfg, err := LoadConfig()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	assertString(t, "guideFile default", cfg.GuideFile, "guide.json")
-}
-
-func TestLoadConfig_DefaultStateFile(t *testing.T) {
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.json")
-	configContent := `{
-				"lineUpID": "test",
-				"storageDir": "/tmp/rec"
-			}`
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatal(err)
-	}
-	wd, _ := os.Getwd()
-	os.Chdir(tmpDir)   //nolint:errcheck
-	defer os.Chdir(wd) //nolint:errcheck
-
-	cfg, err := LoadConfig()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	assertString(t, "stateFile default", cfg.StateFile, "guide_state.json")
 }
 
 func TestLoadConfig_InvalidJSON(t *testing.T) {

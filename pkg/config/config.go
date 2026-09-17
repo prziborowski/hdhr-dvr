@@ -31,8 +31,6 @@ type Config struct {
 	UserID     string `json:"userId"`
 	LineUpID   string `json:"lineUpID"`
 	Days       int    `json:"days"`
-	GuideFile  string `json:"guideFile"`
-	StateFile  string `json:"stateFile"`
 	StorageDir string `json:"storageDir"`
 }
 
@@ -57,14 +55,6 @@ func LoadConfig() (*Config, error) {
 	if config.Days == 0 || config.Days > 8 {
 		log.Printf("WARNING: days=%d is invalid, clamping to 8", config.Days)
 		config.Days = 8
-	}
-	if config.GuideFile == "" {
-		config.GuideFile = "guide.json"
-		log.Println("WARNING: guideFile not set, defaulting to guide.json")
-	}
-	if config.StateFile == "" {
-		config.StateFile = "guide_state.json"
-		log.Println("WARNING: stateFile not set, defaulting to guide_state.json")
 	}
 
 	if config.StorageDir == "" {
