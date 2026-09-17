@@ -82,8 +82,8 @@ func fetchTitanTVScheduleBlock(userId, lineupId string, startTime time.Time) (*t
 	return &response, nil
 }
 
-func fetchLocalChannels() ([]types.Channel, error) {
-	resp, err := http.Get("http://localhost:8080/api/channels")
+func fetchLocalChannels(baseURL string) ([]types.Channel, error) {
+	resp, err := http.Get(baseURL + "/api/channels")
 	if err != nil {
 		return nil, err
 	}
@@ -108,6 +108,11 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	apiBaseURL, err := pkgcfg.APIBaseURL()
+	if err != nil {
+		log.Fatalf("invalid API_BASE_URL: %v", err)
+	}
+
 	loc, err := time.LoadLocation(config.Timezone)
 	if err != nil {
 		log.Fatalf("Invalid timezone %s: %v", config.Timezone, err)
@@ -116,7 +121,7 @@ func main() {
 	log.Printf("Fetching guide data from TitanTV for UserID: %s and LineupID: %s", config.UserID, config.LineUpID)
 
 	// 1. Fetch Local Channels for filtering
-	localChannels, err := fetchLocalChannels()
+	localChannels, err := fetchLocalChannels(apiBaseURL)
 	if err != nil {
 		log.Printf("Error fetching local channels from API: %v. Exiting because local channel list is required for filtering.", err)
 		log.Fatalf("Cannot generate guide without local channel list")

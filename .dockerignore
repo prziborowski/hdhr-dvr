@@ -1,0 +1,9 @@
+.git
+bin/
+recordings.db
+*.ts
+*.mp4
+config.json
+dms/
+.kilo
+*.md

@@ -184,3 +184,47 @@ func assertInt(t *testing.T, label string, got, want int) {
 		t.Fatalf("%s: expected %d, got %d", label, want, got)
 	}
 }
+
+func TestAPIBaseURL_Default(t *testing.T) {
+	t.Setenv("API_BASE_URL", "")
+	got, err := APIBaseURL()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertString(t, "default base url", got, DefaultAPIBaseURL)
+}
+
+func TestAPIBaseURL_FromEnv(t *testing.T) {
+	t.Setenv("API_BASE_URL", "http://svc:8080")
+	got, err := APIBaseURL()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertString(t, "env base url", got, "http://svc:8080")
+}
+
+func TestAPIBaseURL_TrimsTrailingSlash(t *testing.T) {
+	t.Setenv("API_BASE_URL", "http://svc:8080/")
+	got, err := APIBaseURL()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertString(t, "trimmed base url", got, "http://svc:8080")
+}
+
+func TestAPIBaseURL_EmptyEnv(t *testing.T) {
+	t.Setenv("API_BASE_URL", "   ")
+	got, err := APIBaseURL()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertString(t, "empty env base url", got, DefaultAPIBaseURL)
+}
+
+func TestAPIBaseURL_Invalid(t *testing.T) {
+	t.Setenv("API_BASE_URL", "not a url")
+	_, err := APIBaseURL()
+	if err == nil {
+		t.Fatal("expected error for invalid API_BASE_URL")
+	}
+}

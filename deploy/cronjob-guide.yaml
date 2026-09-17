@@ -1,0 +1,48 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hdhr-dvr-guide
+  namespace: default
+spec:
+  schedule: "1 8 * * *"
+  timeZone: "America/Los_Angeles"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: guide
+              image: registry.example.com/hdhr-dvr:latest
+              imagePullPolicy: IfNotPresent
+              command: ["/usr/local/bin/guide"]
+              env:
+                - name: API_BASE_URL
+                  value: "http://REPLACE_IP:8080"
+                - name: TZ
+                  value: "America/Los_Angeles"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              volumeMounts:
+                - name: config
+                  mountPath: /app/config.json
+                  subPath: config.json
+                  readOnly: true
+                - name: data
+                  mountPath: /data
+          volumes:
+            - name: config
+              configMap:
+                name: hdhr-dvr-config
+            - name: data
+              persistentVolumeClaim:
+                claimName: hdhr-dvr-data
