@@ -315,7 +315,8 @@ func calculateDuration(program types.Program) int {
 		}
 
 		if strings.Contains(titleLower, "basketball") ||
-			strings.Contains(titleLower, "football") {
+			strings.Contains(titleLower, "football") ||
+			strings.Contains(titleLower, "soccer") {
 			duration += 15 // Add 15 minutes
 		}
 	}
